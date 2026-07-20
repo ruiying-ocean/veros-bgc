@@ -1,4 +1,5 @@
-Sphinx==4.0.2
-sphinx-rtd-theme==0.5.2
-sphinxcontrib-programoutput==0.17
-veros==0.2.3
+Sphinx>=7
+sphinx-rtd-theme>=2
+sphinxcontrib-programoutput>=0.18
+veros>=1.6.2
+h5netcdf>=1.0

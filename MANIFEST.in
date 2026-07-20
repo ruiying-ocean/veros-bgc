@@ -1,3 +1,2 @@
 include README.md
-include versioneer.py
-include veros_bgc/_version.py
+include veros_bgc/setup/*/assets.json

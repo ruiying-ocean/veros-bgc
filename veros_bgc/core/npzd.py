@@ -1,790 +1,995 @@
-"""
-Contains veros methods for handling bio- and geochemistry
-(currently only simple bio)
-"""
-from collections import namedtuple
+"""MOBI ecosystem dynamics and coupling to the current Veros tracer API.
 
-from veros import veros_method
-from veros import time
-from veros.core import diffusion, thermodynamics, utilities, isoneutral
+This module implements MOBI's ``O_npzd`` core, the ``O_npzd_nitrogen`` and
+required ``O_npzd_o2`` branches, and the optional ``O_carbon`` /
+``O_npzd_alk`` and implicit-calcite branches. The kernel is array based and
+supports both Veros' NumPy and JAX backends.
+"""
+
+from veros import KernelOutput, veros_kernel, veros_routine
+from veros.core import advection, diffusion, utilities
+from veros.core.isoneutral.diffusion import isoneutral_diffusion_tracer
+from veros.core.operators import at, update, update_add
+from veros.core.operators import numpy as npx
 from veros.variables import allocate
 
-
-@veros_method
-def biogeochemistry(vs):
-    """Control function for integration of biogeochemistry
-
-    Implements a rule based strategy. Any interaction between tracers should be
-    described by registering a rule for the interaction.
-    This routine ensures minimum tracer concentrations,
-    calculates primary production, mortality, recyclability, vertical export for
-    general tracers. Tracers should be registered to be used.
-    """
-
-    # Number of timesteps to do for bio tracers
-    nbio = int(vs.dt_tracer // vs.dt_bio)
-
-    # temporary tracer object to store differences
-    for tracer, val in vs.npzd_tracers.items():
-        vs.temporary_tracers[tracer][:, :, :] = val[:, :, :, vs.tau]
-
-    # Flags enable us to only work on tracers with a minimum available concentration
-    flags = {tracer: vs.maskT[...].astype(np.bool) for tracer in vs.temporary_tracers}
-
-    # Pre rules: Changes that need to be applied before running npzd dynamics
-    pre_rules = [(rule.function(vs, rule.source, rule.sink), rule.boundary)
-                 for rule in vs.npzd_pre_rules]
-
-    for rule, boundary in pre_rules:
-        for key, value in rule.items():
-            vs.temporary_tracers[key][boundary] += value
-
-    # How much plankton is blocking light
-    plankton_total = sum([plankton for plankton in vs.temporary_tracers.values()
-                          if hasattr(plankton, 'light_attenuation')]) * vs.dzt
-
-    # Integrated phytplankton - starting from top of layer going upwards
-    # reverse cumulative sum because our top layer is the last.
-    # Needs to be reversed again to reflect direction
-    # phyto_integrated = np.empty_like(vs.temporary_tracers['phytoplankton'])
-    phyto_integrated = np.empty_like(plankton_total)
-    phyto_integrated[:, :, :-1] = plankton_total[:, :, 1:]
-    phyto_integrated[:, :, -1] = 0.0
-
-    # incomming shortwave radiation at top of layer
-    swr = vs.swr[:, :, np.newaxis] * \
-          np.exp(-vs.light_attenuation_phytoplankton
-                 * np.cumsum(phyto_integrated[:, :, ::-1], axis=2)[:, :, ::-1])
-
-    # Reduce incomming light where there is ice - as veros doesn't currently
-    # have an ice model, we get temperatures below -1.8 and decreasing temperature forcing
-    # as recommended by the 4deg model from the setup gallery
-    icemask = np.logical_and(vs.temp[:, :, -1, vs.tau] * vs.maskT[:, :, -1] < -1.8, vs.forc_temp_surface < 0.0)
-    swr[:, :] *= np.exp(-vs.light_attenuation_ice * icemask[:, :, np.newaxis])
-
-    # declination and fraction of day with daylight
-    # 0.72 is fraction of year at aphelion
-    # 0.4 is scaling based on angle of rotation
-    declin = np.sin((np.mod(vs.time * time.SECONDS_TO_X['years'], 1) - 0.72) * 2.0 * np.pi) * 0.4
-    radian = 2 * np.pi / 360  # bohrium doesn't support np.radians, so this is faster
-    rctheta = np.maximum(-1.5, np.minimum(1.5, vs.yt * radian - declin))
-
-    # 1.33 is derived from Snells law for the air-sea barrier
-    vs.rctheta[:] = vs.light_attenuation_water / np.sqrt(1.0 - (1.0 - np.cos(rctheta)**2.0) / 1.33**2)
-
-    # fraction of day with photosynthetically active radiation with a minimum value
-    dayfrac = np.minimum(1.0, -np.tan(radian * vs.yt) * np.tan(declin))
-    vs.dayfrac[:] = np.maximum(1e-12, np.arccos(np.maximum(-1.0, dayfrac)) / np.pi)
-
-    # light at top of grid box
-    grid_light = swr * np.exp(vs.zw[np.newaxis, np.newaxis, :]
-                              * vs.rctheta[np.newaxis, :, np.newaxis])
-
-    # amount of PAR absorbed by water and plankton in each grid cell
-    light_attenuation = vs.dzt * vs.light_attenuation_water +\
-                        plankton_total * vs.light_attenuation_phytoplankton
-
-    # common temperature factor determined according to b ** (cT)
-    vs.bct = vs.bbio ** (vs.cbio * vs.temp[:, :, :, vs.tau])
-
-    # light saturated growth and non-saturated growth
-    jmax, avej = {}, {}
-    for tracer in vs.temporary_tracers.values():
-
-        # Calculate light limited vs unlimited growth
-        if hasattr(tracer, 'potential_growth'):
-            jmax[tracer.name], avej[tracer.name] = tracer.potential_growth(vs, grid_light, light_attenuation)
-
-        # Methods for internal use may need an update
-        if hasattr(tracer, 'update_internal'):
-            tracer.update_internal(vs)
-
-    # bio loop
-    for _ in range(nbio):
-
-        # Plankton is recycled, dying and growing
-        # pre compute amounts for use in rules
-        # for plankton in vs.plankton_types:
-        for tracer in vs.temporary_tracers.values():
-
-            # Nutrient limiting growth - if no limit, growth is determined by avej
-            u = 1
-
-            # limit maximum growth, usually by nutrient deficiency
-            # and calculate primary production from that
-            if hasattr(tracer, 'potential_growth'):
-                # NOTE jmax and avej are NOT updated within bio loop
-                for growth_limiting_function in vs.limiting_functions[tracer.name]:
-                    u = np.minimum(u, growth_limiting_function(vs, vs.temporary_tracers))
-
-                vs.net_primary_production[tracer.name] = flags[tracer.name] * flags['po4'] \
-                    * np.minimum(avej[tracer.name], u * jmax[tracer.name]) * tracer
-
-            # recycling methods - remineralization and fast recycling
-            if hasattr(tracer, 'recycle'):
-                vs.recycled[tracer.name] = flags[tracer.name] * tracer.recycle(vs)
-
-            # Living tracers which can die
-            if hasattr(tracer, 'mortality'):
-                vs.mortality[tracer.name] = flags[tracer.name] * tracer.mortality(vs)
-
-            # tracers which can graze on others
-            if hasattr(tracer, 'grazing'):
-                # TODO handle grazing by multiple zooplankton types
-                # currently this only works with 1 type
-                vs.grazing, vs.digestion, vs.excretion, vs.sloppy_feeding = tracer.grazing(vs, vs.temporary_tracers, flags)
-                vs.excretion_total[...] = sum(vs.excretion.values())
-
-            # Calculate concentration leaving cell and entering from above
-            if hasattr(tracer, 'sinking_speed'):
-                # Concentration of exported material is calculated as fraction
-                # of total concentration which would have fallen through the bottom
-                # of the cell (speed / vs.dzt * vs.dtbio)
-                # vs.dtbio is accounted for later
-                vs.npzd_export[tracer.name] = tracer.sinking_speed / vs.dzt * tracer * flags[tracer.name]
-
-                # Import is export from above scaled by the ratio of cell heights
-                vs.npzd_import[tracer.name] = np.empty_like(vs.npzd_export[tracer.name])
-                vs.npzd_import[tracer.name][:, :, -1] = 0
-                vs.npzd_import[tracer.name][:, :, :-1] = vs.npzd_export[tracer.name][:, :, 1:] * (vs.dzt[1:] / vs.dzt[:-1])
-
-                # ensure we don't import in cells below bottom
-                vs.npzd_import[tracer.name][...] *= vs.maskT
-
-        # Gather all state updates
-        npzd_updates = [(rule.function(vs, rule.source, rule.sink), rule.boundary)
-                        for rule in vs.npzd_rules]
-
-        # perform updates
-        for update, boundary in npzd_updates:
-            for key, value in update.items():
-                if isinstance(boundary, (tuple, slice)):
-                    vs.temporary_tracers[key][boundary] += value * vs.dt_bio
-                else:
-                    vs.temporary_tracers[key] += value * vs.dt_bio * boundary
-
-        # Import and export between layers
-        # for tracer in vs.sinking_speeds:
-        for tracer in vs.temporary_tracers.values():
-            if hasattr(tracer, 'sinking_speed'):
-                tracer[:, :, :] += (vs.npzd_import[tracer.name] - vs.npzd_export[tracer.name]) * vs.dt_bio
-
-        # Prepare temporary tracers for next bio iteration
-        for tracer, data in vs.temporary_tracers.items():
-            flags[tracer][:, :, :] = np.logical_and(flags[tracer], (data > vs.trcmin))
-            data[:, :, :] = utilities.where(vs, flags[tracer], data, vs.trcmin)
-
-    # Post processesing or smoothing rules
-    post_results = [(rule.function(vs, rule.source, rule.sink), rule.boundary)
-                    for rule in vs.npzd_post_rules]
-    post_modified = []  # we only want to reset values, which have acutally changed for performance
-
-    for result, boundary in post_results:
-        for key, value in result.items():
-            vs.temporary_tracers[key][boundary] += value
-            post_modified.append(key)
-
-    # Reset before returning
-    # using set for unique modifications is faster than resetting all tracers
-    for tracer in set(post_modified):
-        data = vs.temporary_tracers[tracer]
-        flags[tracer][:, :, :] = np.logical_and(flags[tracer], (data > vs.trcmin))
-        data[:, :, :] = utilities.where(vs, flags[tracer], data, vs.trcmin)
-
-    # Only return the difference from the current time step. Will be added to timestep taup1
-    return {tracer: vs.temporary_tracers[tracer] - vs.npzd_tracers[tracer][:, :, :, vs.tau]
-            for tracer in vs.npzd_tracers}
-
-
-def general_nutrient_limitation(nutrient, saturation_constant):
-    """ Nutrient limitation form for all nutrients """
-    return nutrient / (saturation_constant + nutrient)
-
-
-@veros_method(inline=True)
-def phosphate_limitation_phytoplankton(vs, tracers):
-    """ Phytoplankton limit to growth by phosphate limitation """
-    return general_nutrient_limitation(tracers['po4'], vs.saturation_constant_N * vs.redfield_ratio_PN)
-
-
-@veros_method(inline=True)
-def register_npzd_data(vs, tracer):
-    """ Add tracer to the NPZD data set and create node in interaction graph
-
-    Tracers added are available in the npzd dynamics and is automatically
-    included in transport equations
-
-    Parameters
-    ----------
-    tracer
-        An instance of :obj:`veros.core.npzd_tracer.NPZD_tracer`
-        to be included in biogeochemistry calculations
-    """
-
-    if tracer.name in vs.npzd_tracers.keys():
-        raise ValueError('{name} has already been added to the NPZD data set'.format(name=tracer.name))
-
-    vs.npzd_tracers[tracer.name] = tracer
-
-    if tracer.transport:
-        vs.npzd_transported_tracers.append(tracer.name)
-
-
-@veros_method(inline=True)
-def _get_boundary(vs, boundary_string):
-    """ Return slice representing boundary
-
-    Parameters
-    ----------
-    boundary_string
-        Identifer for boundary. May take one of the following values:
-        SURFACE:       [:, :, -1] only the top layer
-        BOTTOM:        bottom_mask as set by veros
-        else:          [:, :, :] everything
-    """
-
-    if boundary_string == 'SURFACE':
-        return tuple([slice(None, None, None), slice(None, None, None), -1])
-
-    if boundary_string == 'BOTTOM':
-        return vs.bottom_mask
-
-    return tuple([slice(None, None, None)] * 3)
-
-
-@veros_method(inline=True)
-def register_npzd_rule(vs, name, rule, label=None, boundary=None, group='PRIMARY'):
-    """ Make rule available to the npzd dynamics
-
-    The rule specifies an interaction between two tracers.
-    It may additionally specify where in the grid it works as
-    well as where in the execution order.
-
-    Note
-    ----
-    Registering a rule is not sufficient for inclusion in dynamics.
-    It must also be selected using select_npzd_rule.
-
-    Parameters
-    ----------
-    name
-        Unique identifier for the rule
-
-    rule
-        A list of rule names or tuple containing:
-            function: function to be called
-            source: what is being consumed
-            destination: what is growing from consuming
-    label
-        A description for graph. See :obj:`veros.diagnostics.biogeochemistry`
-
-    boundary
-        'SURFACE', 'BOTTOM' or None, see _get_boundary
-
-    group
-        'PRIMARY' (default): Rule is evaluated in primary execution loop nbio times with timestepping
-        'PRE': Rule is evaluated once before primary loop
-        'POST': Rule is evaluated once after primary loop
-    """
-
-    Rule = namedtuple('Rule', ['function', 'source', 'sink', 'label', 'boundary', 'group'])
-
-    if name in vs.npzd_available_rules:
-        raise ValueError('Rule %s already exists, please verify the rule has not already been added and replace the chosen name' % name)
-
-    if isinstance(rule, list):
-        if label or boundary:
-            raise ValueError('Cannot add labels or boundaries to rule groups')
-        vs.npzd_available_rules[name] = rule
-
-    else:
-        label = label or '?'  # label is just for the interaction graph
-        vs.npzd_available_rules[name] = Rule(function=rule[0], source=rule[1],
-                                             sink=rule[2], label=label,
-                                             boundary=_get_boundary(vs, boundary),
-                                             group=group)
-
-@veros_method(inline=True)
-def register_npzd_common_source_rule(vs, name, rule, label=None, boundary=None, group='PRIMARY'):
-    """ Register a rule to the model, which shares source term with other rules.
-
-    This function creates stub rules for each individual term by evaluating the original rule and
-    returning only the sink part of the original rule. Additionally there will be created a stub
-    rule for the source term based on the first registered rule for the common source. Therefore a
-    common source rule is best suited for rules, where the source terms has been preevaluated.
-    The new registered rules are available with the name given by the parameter :obj:`name`
-    postfixed by an underscore followed by the name of the tracer to be affected as specified in the
-    rule. All created rules will be made available as a rule collection to be activated collectively
-    with the name specified by the parameter :obj:`name`.
-    Parameters are the same as register_npzd_rule
-
-    Note
-    ----
-    Should only be used for rules, where the source term is exactly the same.
-
-    Parameters
-    ----------
-    name
-        Unique identifier for the rule
-
-    rule
-        A list of rule names or tuple containing:
-            function: function to be called
-            source: what is being consumed
-            destination: what is growing from consuming
-    label
-        A description for graph. See :obj:`veros.diagnostics.biogeochemistry`
-
-    boundary
-        'SURFACE', 'BOTTOM' or None, see _get_boundary
-
-    group
-        'PRIMARY' (default): Rule is evaluated in primary execution loop nbio times with timestepping
-        'PRE': Rule is evaluated once before primary loop
-        'POST': Rule is evaluated once after primary loop
-    """
-    # The rule collection is made in setup_npzd based on the concents of common_source_rules
-
-    if isinstance(rule, list):
-        raise ValueError('register_npzd_common_source_rule does not accept list of rule names as rule parameter')
-
-    # This should maybe be done elsewhere
-    # Ensure that the common source rules dictionary exists
-    # register_nzpd_rule handles not allowing multiple rules with the same name,
-    # therefore also handling not having the same sink defined twice or the source also being a sink
-    if not hasattr(vs, 'common_source_rules'):
-        vs.common_source_rules = {}
-
-    # If no rule for this name has been added yet, add the source term
-    if name not in vs.common_source_rules.keys():
-        vs.common_source_rules[name] = []
-
-        # Add the source term
-        # The new rule should consist of a new function, which is callable like the initial function of the rule, but only returns the source term
-        source_rule = (veros_method(lambda veros, source, sink: {source: rule[0](veros, source, sink)[source]}, inline=True), rule[1], rule[2])
-        register_npzd_rule(vs, f'{name}_{rule[1]}', source_rule, label=label + '(source)', boundary=boundary, group=group)
-
-        vs.common_source_rules[name].append(source_rule)
-
-    # Register new stub rule for the sink - source is assumed common so only added for the first
-    sink_rule = (veros_method(lambda veros, source, sink: {sink: rule[0](veros, source, sink)[sink]}, inline=True), rule[1], rule[2])
-    register_npzd_rule(vs, f'{name}_{rule[2]}', sink_rule, label=label, boundary=boundary, group=group)
-
-    vs.common_source_rules[name].append(sink_rule)
-
-    # Ensure that the registered rule works on the same boundary and same execution group as the source
-    # The boundary is in principle not a strict requirement, but should in practice always be the same
-    registered_source = vs.npzd_available_rules[f'{name}_{rule[1]}']
-    registered_sink = vs.npzd_available_rules[f'{name}_{rule[2]}']
-
-    if registered_source.boundary != registered_sink.boundary:
-        raise ValueError(f'Common source rules must have the same boundary for both source and sink but {registered_source.name} did not match {registered_sink.name}. Expected {registered_source.boundary}, got {registed_sink.boundary}')
-    if registered_source.group != registered_sink.group:
-        raise ValueError(f'Common source rules must have the same group for both source and sink but {registered_source.name} did not match {registered_sink.name}. Expected {registered_source.group}, got {registed_sink.group}')
-
-    # Make sure that the sources are actually listed as the same.
-    # This check should not be necesarry if the user actually wants to register rules for a common source
-    if registered_source.source != rule[1]:
-        raise ValueError(f'Common source rules should have a common source, but {registered_source.name} did not match {registered_sink.name}. Expected {registered_source.source}, got {rule[1]}')
-
-
-@veros_method(inline=True)
-def select_npzd_rule(vs, name):
-    """
-    Select rule for the NPZD model
-
-    Parameters
-    ----------
-    name
-        Name of the rule to be selected
-    """
-
-    # activate rule by selecting from available rules
-    rule = vs.npzd_available_rules[name]
-    if name in vs.npzd_selected_rule_names:
-        raise ValueError('Rules must have unique names, %s defined multiple times' % name)
-
-    vs.npzd_selected_rule_names.append(name)
-
-    # we may activate each rule in a list of rules
-    if isinstance(rule, list):
-        for r in rule:
-            select_npzd_rule(vs, r)
-
-    # or activate a single rule
-    elif isinstance(rule, tuple):
-
-        if rule.group == 'PRIMARY':
-            vs.npzd_rules.append(rule)
-        elif rule.group == 'PRE':
-            vs.npzd_pre_rules.append(rule)
-        elif rule.group == 'POST':
-            vs.npzd_post_rules.append(rule)
-
-    else:
-        raise TypeError('Rule must be of type tuple or list')
-
-
-@veros_method(inline=True)
-def setup_basic_npzd_rules(vs):
-    """
-    Setup rules for basic NPZD model including phosphate, detritus, phytoplankton and zooplankton
-    """
-    from .npzd_rules import grazing, mortality, sloppy_feeding, recycling_to_po4, \
-        primary_production, empty_rule, \
-        bottom_remineralization_detritus_po4
-
-    from .npzd_tracers import Recyclable_tracer, Phytoplankton, Zooplankton, NPZD_tracer
-
-    # TODO - couldn't this be created elsewhere or can I use vs.kbot more efficiently?
-    vs.bottom_mask[:, :, :] = np.arange(vs.nz)[np.newaxis, np.newaxis, :] == (vs.kbot - 1)[:, :, np.newaxis]
-
-    zw = vs.zw - vs.dzt  # bottom of grid box using dzt because dzw is weird
-    dtr_speed = (vs.wd0 + vs.mw * np.where(-zw < vs.mwz, -zw, vs.mwz)) \
-        * vs.maskT
-
-    detritus = Recyclable_tracer(vs.detritus, 'detritus',
-                                 sinking_speed=dtr_speed,
-                                 recycling_rate=vs.remineralization_rate_detritus)
-
-    phytoplankton = Phytoplankton(vs.phytoplankton, 'phytoplankton',
-                                  light_attenuation=vs.light_attenuation_phytoplankton,
-                                  growth_parameter=vs.maximum_growth_rate_phyto,
-                                  recycling_rate=vs.fast_recycling_rate_phytoplankton,
-                                  mortality_rate=vs.specific_mortality_phytoplankton)
-
-    zooplankton = Zooplankton(vs.zooplankton, 'zooplankton',
-                              max_grazing=vs.maximum_grazing_rate,
-                              grazing_saturation_constant=vs.saturation_constant_Z_grazing,
-                              assimilation_efficiency=vs.assimilation_efficiency,
-                              growth_efficiency=vs.zooplankton_growth_efficiency,
-                              grazing_preferences=vs.zprefs,
-                              mortality_rate=vs.quadric_mortality_zooplankton)
-
-    po4 = NPZD_tracer(vs.po4, 'po4')
-
-    # Add tracers to the model
-    register_npzd_data(vs, detritus)
-    register_npzd_data(vs, phytoplankton)
-    register_npzd_data(vs, zooplankton)
-    register_npzd_data(vs, po4)
-
-    vs.limiting_functions['phytoplankton'] = [phosphate_limitation_phytoplankton]
-
-    # Zooplankton preferences for grazing on keys
-    # Values are scaled automatically at the end of this function
-    vs.zprefs['phytoplankton'] = vs.zprefP
-    vs.zprefs['zooplankton'] = vs.zprefZ
-    vs.zprefs['detritus'] = vs.zprefDet
-
-    # Register rules for interactions between active tracers
-    register_npzd_rule(vs, 'npzd_basic_phytoplankton_grazing',
-                       (grazing, 'phytoplankton', 'zooplankton'),
-                       label='Grazing')
-    register_npzd_rule(vs, 'npzd_basic_phytoplankton_mortality',
-                       (mortality, 'phytoplankton', 'detritus'),
-                       label='Mortality')
-    register_npzd_rule(vs, 'npzd_basic_phytoplankton_fast_recycling',
-                       (recycling_to_po4, 'phytoplankton', 'po4'),
-                       label='Fast recycling')
-    register_npzd_rule(vs, 'npzd_basic_zooplankton_grazing',
-                       (empty_rule, 'zooplankton', 'zooplankton'),
-                       label='Grazing')
-    register_npzd_rule(vs, 'npzd_basic_zooplankton_mortality',
-                       (mortality, 'zooplankton', 'detritus'),
-                       label='Mortality')
-    register_npzd_rule(vs, 'npzd_basic_zooplankton_sloppy_feeding',
-                       (sloppy_feeding, 'zooplankton', 'detritus'),
-                       label='Sloppy feeding')
-    register_npzd_rule(vs, 'npzd_basic_detritus_grazing',
-                       (grazing, 'detritus', 'zooplankton'),
-                       label='Grazing')
-    register_npzd_rule(vs, 'npzd_basic_detritus_remineralization',
-                       (recycling_to_po4, 'detritus', 'po4'),
-                       label='Remineralization')
-    register_npzd_rule(vs, 'npzd_basic_phytoplankton_primary_production',
-                       (primary_production, 'po4', 'phytoplankton'),
-                       label='Primary production')
-
-    register_npzd_rule(vs, 'npzd_basic_detritus_bottom_remineralization',
-                       (bottom_remineralization_detritus_po4, 'detritus', 'po4'),
-                       label='Bottom remineralization', boundary='BOTTOM')
-
-    register_npzd_rule(vs, 'group_npzd_basic', [
-        'npzd_basic_phytoplankton_grazing',
-        'npzd_basic_phytoplankton_mortality',
-        'npzd_basic_phytoplankton_fast_recycling',
-        'npzd_basic_phytoplankton_primary_production',
-        'npzd_basic_zooplankton_grazing',
-        'npzd_basic_zooplankton_mortality',
-        'npzd_basic_zooplankton_sloppy_feeding',
-        'npzd_basic_detritus_remineralization',
-        'npzd_basic_detritus_grazing',
-        'npzd_basic_detritus_bottom_remineralization'
-    ])
-
-    register_npzd_rule(vs, 'empty_rule', (empty_rule, None, None))
-
-
-@veros_method(inline=True)
-def setup_carbon_npzd_rules(vs):
-    """
-    Rules for including a carbon cycle
-    """
-    # The actual action is on DIC, but the to variables overlap
-    from .npzd_rules import co2_surface_flux, recycling_to_dic, \
-        primary_production_from_DIC, excretion_dic, recycling_phyto_to_dic, \
-        dic_alk_scale, calcite_production_phyto, calcite_production_phyto_alk, \
-        post_redistribute_calcite, post_redistribute_calcite_alk, pre_reset_calcite, \
-        bottom_remineralization_detritus_DIC
-
-    from .npzd_tracers import NPZD_tracer
-
-    zw = vs.zw - vs.dzt  # bottom of grid box using dzt because dzw is weird
-
-    # redistribution fraction for calcite at level k
-    vs.rcak[:, :, :-1] = (- np.exp(zw[:-1] / vs.dcaco3) + np.exp(zw[1:] / vs.dcaco3)) / vs.dzt[:-1]
-    vs.rcak[:, :, -1] = - (np.exp(zw[-1] / vs.dcaco3) - 1.0) / vs.dzt[-1]
-
-    # redistribution fraction at bottom
-    rcab = np.empty_like(vs.dic[..., 0])
-    rcab[:, : -1] = 1 / vs.dzt[-1]
-    rcab[:, :, :-1] = np.exp(zw[:-1] / vs.dcaco3) / vs.dzt[1:]
-
-    # merge bottom into level k and reset every cell outside ocean
-    vs.rcak[vs.bottom_mask] = rcab[vs.bottom_mask]
-    vs.rcak[...] *= vs.maskT
-
-    # Need to track dissolved inorganic carbon, alkalinity
-    dic = NPZD_tracer(vs.dic, 'DIC')
-    alk = NPZD_tracer(vs.alkalinity, 'alkalinity')
-    register_npzd_data(vs, dic)
-    register_npzd_data(vs, alk)
-
-    # Only for collection purposes - to be redistributed in post rules
-    caco3 = NPZD_tracer(np.zeros_like(vs.dic), "caco3", transport=False)
-    register_npzd_data(vs, caco3)
-
-    # Atmosphere
-    register_npzd_rule(vs, 'npzd_carbon_flux',
-                       (co2_surface_flux, 'co2', 'DIC'),
-                       boundary='SURFACE', group='PRE',
-                       label='Atmosphere exchange')
-
-    # Common rule set for nutrient
-    register_npzd_rule(vs, 'npzd_carbon_recycling_detritus_dic',
-                       (recycling_to_dic, 'detritus', 'DIC'),
-                       label='Remineralization')
-    register_npzd_rule(vs, 'npzd_carbon_primary_production_dic',
-                       (primary_production_from_DIC, 'DIC', 'phytoplankton'),
-                       label='Primary production')
-    register_npzd_rule(vs, 'npzd_carbon_recycling_phyto_dic',
-                       (recycling_phyto_to_dic, 'phytoplankton', 'DIC'),
-                       label='Fast recycling')
-    register_npzd_rule(vs, 'npzd_carbon_excretion_dic',
-                       (excretion_dic, 'zooplankton', 'DIC'),
-                       label='Excretion')
-    register_npzd_rule(vs, 'npzd_carbon_calcite_production_dic',
-                       (calcite_production_phyto, 'DIC', 'caco3'),
-                       label='Production of calcite')
-    register_npzd_rule(vs, 'npzd_carbon_calcite_production_alk',
-                       (calcite_production_phyto_alk, 'alkalinity', 'caco3'),
-                       label='Production of calcite')
-
-    # BOTTOM
-    register_npzd_rule(vs, 'npzd_carbon_detritus_bottom_remineralization',
-                       (bottom_remineralization_detritus_DIC, 'detritus', 'DIC'),
-                       label='Bottom remineralization', boundary='BOTTOM')
-
-    # POST rules
-    register_npzd_rule(vs, 'npzd_carbon_dic_alk',
-                       (dic_alk_scale, 'DIC', 'alkalinity'),
-                       group='POST',
-                       label='Changes in DIC reflected in ALK')
-    register_npzd_rule(vs, 'npzd_carbon_post_distribute_calcite_alk',
-                       (post_redistribute_calcite_alk, 'caco3', 'alkalinity'),
-                       label='dissolution', group='POST')
-    register_npzd_rule(vs, 'npzd_carbon_post_distribute_calcite_dic',
-                       (post_redistribute_calcite, 'caco3', 'DIC'),
-                       label='dissolution', group='POST')
-
-    # PRE
-    register_npzd_rule(vs, 'pre_reset_calcite',
-                       (pre_reset_calcite, 'caco3', 'caco3'),
-                       label='reset', group='PRE')
-
-    register_npzd_rule(vs, 'group_carbon_implicit_caco3', [
-        'npzd_carbon_flux',
-        'npzd_carbon_recycling_detritus_dic',
-        'npzd_carbon_primary_production_dic',
-        'npzd_carbon_recycling_phyto_dic',
-        'npzd_carbon_excretion_dic',
-        'npzd_carbon_dic_alk',
-        'npzd_carbon_calcite_production_dic',
-        'npzd_carbon_calcite_production_alk',
-        'npzd_carbon_post_distribute_calcite_alk',
-        'npzd_carbon_post_distribute_calcite_dic',
-        'npzd_carbon_detritus_bottom_remineralization',
-        'pre_reset_calcite',
-    ])
-
-
-@veros_method
-def setupNPZD(vs):
-    """Taking veros variables and packaging them up into iterables"""
-    if not vs.enable_npzd:
+from . import atmospherefluxes
+
+TRACER_FIELDS = (
+    ("phytoplankton", "dphytoplankton"),
+    ("zooplankton", "dzooplankton"),
+    ("detritus", "ddetritus"),
+    ("po4", "dpo4"),
+)
+NITROGEN_FIELDS = (
+    ("no3", "dno3"),
+    ("dop", "ddop"),
+    ("don", "ddon"),
+    ("diazotrophs", "ddiazotrophs"),
+    ("oxygen", "doxygen"),
+)
+CARBON_FIELDS = (("dic", "ddic"), ("alkalinity", "dalkalinity"))
+
+
+def _bio_timestep(settings):
+    dt_bio = settings.dt_bio if settings.dt_bio > 0.0 else settings.dt_tracer / 4.0
+    n_substeps = int(round(settings.dt_tracer / dt_bio))
+    return dt_bio, n_substeps
+
+
+@veros_routine
+def setup_npzd(state):
+    """Validate MOBI settings and initialize geometry-dependent fields."""
+
+    settings = state.settings
+    if not settings.enable_npzd:
         return
 
-    setup_basic_npzd_rules(vs)
+    dt_bio, n_substeps = _bio_timestep(settings)
+    if dt_bio <= 0.0 or n_substeps < 1:
+        raise ValueError("dt_bio must be positive and no larger than dt_tracer")
+    if abs(n_substeps * dt_bio - settings.dt_tracer) > 1e-10 * settings.dt_tracer:
+        raise ValueError("dt_tracer must be an integer multiple of dt_bio")
+    if (
+        settings.enable_carbon
+        and settings.enable_implicit_calcite
+        and settings.dcaco3 <= 0.0
+    ):
+        raise ValueError("dcaco3 must be positive when the carbon cycle is enabled")
 
-    # Add carbon to the model
-    if vs.enable_carbon:
-        setup_carbon_npzd_rules(vs)
+    preference_sum = settings.zprefP + settings.zprefZ + settings.zprefDet
+    if settings.enable_nitrogen:
+        preference_sum += settings.zprefDiaz
+    if preference_sum <= 0.0:
+        raise ValueError("at least one zooplankton grazing preference must be positive")
+    if settings.enable_nitrogen:
+        if settings.diazotroph_NP_ratio <= 0.0:
+            raise ValueError("diazotroph_NP_ratio must be positive")
+        for name in (
+            "refractory_fraction_phytoplankton_mortality",
+            "refractory_fraction_phytoplankton_recycling",
+            "dop_uptake_efficiency",
+        ):
+            value = getattr(settings, name)
+            if value < 0.0 or value > 1.0:
+                raise ValueError(f"{name} must be between zero and one")
 
-    from .npzd_rules import excretion
-    register_npzd_common_source_rule(vs, 'npzd_basic_zooplankton_excretion',
-                                     (excretion, 'zooplankton', 'po4'),
-                                     label='Excretion')
-
-    register_npzd_common_source_rule(vs, 'npzd_basic_zooplankton_excretion',
-                                     (excretion, 'zooplankton', 'DIC'),
-                                     label='Excretion')
-
-    # Turn common source rules into selectable rules
-    # We should not have to make this check, it should just be defined
-    if hasattr(vs, 'common_source_rules'):
-        # All common source rules have been saved to a dictionary
-        # where the key is the collection identifier and individual rules are
-        # named after the convention {collection_name}_{tracer_name}
-        for name, rules in vs.common_source_rules.items():
-            collection = [name + "_" + rules[0][1]] + [name + "_" + rules[i][2] for i in range(1, len(rules))]
-            register_npzd_rule(vs, name, collection)
-
-    for rule in vs.npzd_selected_rules:
-        select_npzd_rule(vs, rule)
-
-    # Update Zooplankton preferences dynamically
-    # Ideally this would be done in the Zooplankton class
-    zprefsum = sum(vs.zprefs.values())
-    for preference in vs.zprefs:
-        vs.zprefs[preference] /= zprefsum
-
-    # Keep derivatives of everything for advection
-    for tracer, data in vs.npzd_tracers.items():
-        vs.npzd_advection_derivatives[tracer] = np.zeros_like(data)
-
-    # Temporary tracers are necessary to only return differences
-    for tracer, data in vs.npzd_tracers.items():
-        vs.temporary_tracers[tracer] = np.empty_like(data[..., 0])
+    state.variables.update(setup_npzd_kernel(state))
 
 
-@veros_method
-def npzd(vs):
-    r"""
-    Main driving function for NPZD functionality
+@veros_kernel
+def setup_npzd_kernel(state):
+    vs = state.variables
+    settings = state.settings
 
-    Computes transport terms and biological activity separately
+    vertical_index = npx.arange(settings.nz)[npx.newaxis, npx.newaxis, :]
+    bottom_mask = npx.logical_and(
+        vs.maskT,
+        vertical_index == (vs.kbot[:, :, npx.newaxis] - 1),
+    )
 
-    \begin{equation}
-        \dfrac{\partial C_i}{\partial t} = T + S
-    \end{equation}
-    """
-    if not vs.enable_npzd:
+    out = {"bottom_mask": bottom_mask}
+
+    if settings.enable_carbon:
+        # ``zw`` is the upper face of each T cell and is zero at the sea
+        # surface.  Calcite follows an exponential dissolution profile; any
+        # material left at the seabed dissolves in the deepest wet cell.
+        top_depth = npx.maximum(-vs.zw, 0.0)
+        bottom_depth = top_depth + vs.dzt
+        profile_1d = (
+            npx.exp(-top_depth / settings.dcaco3)
+            - npx.exp(-bottom_depth / settings.dcaco3)
+        ) / vs.dzt
+        seabed_1d = npx.exp(-top_depth / settings.dcaco3) / vs.dzt
+        profile = npx.broadcast_to(
+            profile_1d[npx.newaxis, npx.newaxis, :], vs.maskT.shape
+        )
+        seabed = npx.broadcast_to(
+            seabed_1d[npx.newaxis, npx.newaxis, :], vs.maskT.shape
+        )
+        out["rcak"] = npx.where(bottom_mask, seabed, profile) * vs.maskT
+
+    return KernelOutput(**out)
+
+
+@veros_routine
+def npzd(state):
+    """Advance MOBI tracers by one Veros tracer time step."""
+
+    if not state.settings.enable_npzd:
         return
 
-    # TODO: Refactor transportation code to be defined only once and also used by thermodynamics
-    # TODO: Dissipation on W-grid if necessary
+    state.variables.update(integrate_npzd(state))
 
-    npzd_changes = biogeochemistry(vs)
 
+@veros_kernel
+def integrate_npzd(state):
+    """Couple MOBI source terms to Veros tracer transport."""
+
+    vs = state.variables
+    settings = state.settings
+    out = {}
+
+    if settings.enable_carbon:
+        carbon = atmospherefluxes.carbon_flux(state)
+        surface_carbon_flux = carbon.cflux
+        out.update(
+            cflux=carbon.cflux,
+            wind_speed=carbon.wind_speed,
+            hSWS=carbon.hSWS,
+            pCO2=carbon.pCO2,
+            dpCO2=carbon.dpCO2,
+            co2star=carbon.co2star,
+            dco2star=carbon.dco2star,
+        )
+    else:
+        surface_carbon_flux = npx.zeros_like(vs.swr)
+
+    biology = mobi_biology(state, surface_carbon_flux)
+
+    for tracer_name, tendency_name in TRACER_FIELDS:
+        tracer, tendency = transport_tracer(
+            state,
+            getattr(vs, tracer_name),
+            getattr(vs, tendency_name),
+            getattr(biology, f"{tracer_name}_change"),
+        )
+        out[tracer_name] = tracer
+        out[tendency_name] = tendency
+
+    if settings.enable_nitrogen:
+        for tracer_name, tendency_name in NITROGEN_FIELDS:
+            tracer, tendency = transport_tracer(
+                state,
+                getattr(vs, tracer_name),
+                getattr(vs, tendency_name),
+                getattr(biology, f"{tracer_name}_change"),
+            )
+            out[tracer_name] = tracer
+            out[tendency_name] = tendency
+
+    if settings.enable_carbon:
+        for tracer_name, tendency_name in CARBON_FIELDS:
+            tracer, tendency = transport_tracer(
+                state,
+                getattr(vs, tracer_name),
+                getattr(vs, tendency_name),
+                getattr(biology, f"{tracer_name}_change"),
+            )
+            out[tracer_name] = tracer
+            out[tendency_name] = tendency
+
+    out.update(
+        rctheta=biology.rctheta,
+        dayfrac=biology.dayfrac,
+        excretion_total=biology.excretion_total,
+        net_primary_production=biology.net_primary_production,
+        detritus_remineralization=biology.detritus_remineralization,
+        detritus_export=biology.detritus_export,
+    )
+    if settings.enable_nitrogen:
+        out.update(
+            diazotroph_primary_production=biology.diazotroph_primary_production,
+            nitrogen_fixation=biology.nitrogen_fixation,
+            water_column_denitrification=biology.water_column_denitrification,
+            benthic_denitrification=biology.benthic_denitrification,
+        )
+
+    return KernelOutput(**out)
+
+
+@veros_kernel
+def mobi_biology(state, surface_carbon_flux):
+    """Integrate MOBI source/sink terms over one Veros tracer step.
+
+    The implementation follows the ``O_npzd`` source terms and, when enabled,
+    the ``O_npzd_nitrogen`` / ``O_npzd_o2`` branches in
+    ``mobi_src/updates/npzd_src.F``. Returned ``*_change`` fields are finite
+    concentration increments, not tendencies.
     """
-    For vertical mixing
+
+    vs = state.variables
+    settings = state.settings
+    dt_bio, n_substeps = _bio_timestep(settings)
+    mask = vs.maskT
+
+    phyto_initial = vs.phytoplankton[..., vs.tau]
+    zoo_initial = vs.zooplankton[..., vs.tau]
+    detritus_initial = vs.detritus[..., vs.tau]
+    po4_initial = vs.po4[..., vs.tau]
+
+    phyto = npx.maximum(phyto_initial, settings.trcmin) * mask
+    zoo = npx.maximum(zoo_initial, settings.trcmin) * mask
+    detritus = npx.maximum(detritus_initial, settings.trcmin) * mask
+    po4 = npx.maximum(po4_initial, settings.trcmin) * mask
+
+    if settings.enable_nitrogen:
+        no3_initial = vs.no3[..., vs.tau]
+        dop_initial = vs.dop[..., vs.tau]
+        don_initial = vs.don[..., vs.tau]
+        diazotrophs_initial = vs.diazotrophs[..., vs.tau]
+        oxygen_initial = vs.oxygen[..., vs.tau]
+        no3 = npx.maximum(no3_initial, settings.trcmin) * mask
+        dop = npx.maximum(dop_initial, settings.trcmin) * mask
+        don = npx.maximum(don_initial, settings.trcmin) * mask
+        diazotrophs = npx.maximum(diazotrophs_initial, settings.trcmin) * mask
+        oxygen = npx.maximum(oxygen_initial, settings.trcmin) * mask
+    else:
+        no3 = npx.zeros_like(phyto)
+        dop = npx.zeros_like(phyto)
+        don = npx.zeros_like(phyto)
+        diazotrophs = npx.zeros_like(phyto)
+        oxygen = npx.zeros_like(phyto)
+
+    if settings.enable_carbon:
+        dic_initial = vs.dic[..., vs.tau]
+        alkalinity_initial = vs.alkalinity[..., vs.tau]
+        dic = npx.maximum(dic_initial, settings.trcmin) * mask
+        alkalinity = npx.maximum(alkalinity_initial, settings.trcmin) * mask
+        dic = update_add(
+            dic,
+            at[:, :, -1],
+            surface_carbon_flux * settings.dt_tracer / vs.dzt[-1],
+        )
+    else:
+        dic = npx.zeros_like(phyto)
+        alkalinity = npx.zeros_like(phyto)
+
+    # Seasonal declination, refracted path length, and daylight fraction.
+    year_fraction = npx.mod(vs.time / (360.0 * 86400.0), 1.0)
+    declination = npx.sin((year_fraction - 0.72) * 2.0 * settings.pi) * 0.4
+    radians = settings.pi / 180.0
+    incidence = npx.clip(vs.yt * radians - declination, -1.5, 1.5)
+    rctheta = settings.light_attenuation_water / npx.sqrt(
+        1.0 - (1.0 - npx.cos(incidence) ** 2) / 1.33**2
+    )
+    day_argument = npx.clip(-npx.tan(vs.yt * radians) * npx.tan(declination), -1.0, 1.0)
+    dayfrac = npx.maximum(1e-12, npx.arccos(day_argument) / settings.pi)
+
+    # Light at the top of every cell.  Veros orders z from seafloor to
+    # surface, hence the reverse cumulative sum.
+    light_blockers = phyto + diazotrophs
+    plankton_inventory = light_blockers * vs.dzt[npx.newaxis, npx.newaxis, :]
+    integrated_above = (
+        npx.cumsum(plankton_inventory[:, :, ::-1], axis=2)[:, :, ::-1]
+        - plankton_inventory
+    )
+    top_depth = npx.maximum(-vs.zw, 0.0)
+    light = (
+        2.0
+        * settings.photosynthesis_initial_slope
+        * settings.photosynthetically_active_radiation_fraction
+        * vs.swr[:, :, npx.newaxis]
+        * npx.exp(-settings.light_attenuation_phytoplankton * integrated_above)
+        * npx.exp(
+            -top_depth[npx.newaxis, npx.newaxis, :]
+            * rctheta[npx.newaxis, :, npx.newaxis]
+        )
+    )
+    ice_mask = npx.logical_and(
+        vs.temp[:, :, -1, vs.tau] * mask[:, :, -1] < -1.8,
+        vs.forc_temp_surface <= 0.0,
+    )
+    light = light * npx.exp(
+        -settings.light_attenuation_ice * ice_mask[:, :, npx.newaxis]
+    )
+
+    bct = settings.bbio ** (settings.cbio * vs.temp[..., vs.tau])
+    jmax = settings.maximum_growth_rate_phyto * bct
+    gd = npx.maximum(jmax * dayfrac[npx.newaxis, :, npx.newaxis], 1e-30)
+    attenuation = (
+        settings.light_attenuation_water
+        + settings.light_attenuation_phytoplankton * light_blockers
+    ) * vs.dzt[npx.newaxis, npx.newaxis, :]
+    attenuation = npx.maximum(attenuation, 1e-30)
+    f1 = npx.exp(-attenuation)
+    u1 = npx.maximum(light / gd, settings.u1_min)
+    u2 = npx.maximum(u1 * f1, settings.u1_min * f1)
+    phi1 = _evans_parslow_phi(u1)
+    phi2 = _evans_parslow_phi(u2)
+    average_light_growth = gd * (phi1 - phi2) / attenuation * mask
+
+    capped_temperature_factor = settings.bbio ** (
+        settings.cbio
+        * npx.minimum(settings.zooplankton_max_growth_temp, vs.temp[..., vs.tau])
+    )
+    if settings.enable_nitrogen:
+        oxygen_grazing_factor = 0.5 * (npx.tanh(oxygen - 8.0) + 1.0)
+        gmax = (
+            settings.maximum_grazing_rate
+            * oxygen_grazing_factor
+            * capped_temperature_factor
+        )
+        detritus_remineralization_rate = (
+            settings.remineralization_rate_detritus
+            * (0.65 + 0.35 * npx.tanh(oxygen - 3.0))
+            * bct
+        )
+        jmax_diazotrophs = (
+            npx.maximum(0.0, settings.maximum_growth_rate_phyto * (bct - 2.6))
+            * settings.diazotroph_growth_rate_factor
+        )
+        gd_diazotrophs = npx.maximum(
+            jmax_diazotrophs * dayfrac[npx.newaxis, :, npx.newaxis], 1e-14
+        )
+        u1_diazotrophs = npx.maximum(light / gd_diazotrophs, settings.u1_min)
+        u2_diazotrophs = npx.maximum(u1_diazotrophs * f1, settings.u1_min * f1)
+        average_light_growth_diazotrophs = (
+            gd_diazotrophs
+            * (_evans_parslow_phi(u1_diazotrophs) - _evans_parslow_phi(u2_diazotrophs))
+            / attenuation
+            * mask
+        )
+    else:
+        gmax = settings.maximum_grazing_rate * capped_temperature_factor
+        detritus_remineralization_rate = settings.remineralization_rate_detritus * bct
+        jmax_diazotrophs = npx.zeros_like(phyto)
+        average_light_growth_diazotrophs = npx.zeros_like(phyto)
+
+    fast_recycling_rate = settings.fast_recycling_rate_phytoplankton * bct
+    fast_recycling_rate_diazotrophs = settings.fast_recycling_rate_diazotrophs * bct
+    cell_depth = npx.maximum(-vs.zt, 0.0)
+    sinking_speed = settings.wd0 + settings.mw * npx.minimum(cell_depth, settings.mwz)
+    sinking_rate = (
+        sinking_speed[npx.newaxis, npx.newaxis, :] / vs.dzt[npx.newaxis, npx.newaxis, :]
+    )
+
+    phyto_flag = npx.logical_and(mask, phyto_initial > settings.trcmin)
+    zoo_flag = npx.logical_and(mask, zoo_initial > settings.trcmin)
+    detritus_flag = npx.logical_and(mask, detritus_initial > settings.trcmin)
+    po4_flag = npx.logical_and(mask, po4_initial > settings.trcmin)
+
+    if settings.enable_nitrogen:
+        no3_flag = npx.logical_and(mask, no3_initial > settings.trcmin)
+        dop_flag = npx.logical_and(mask, dop_initial > settings.trcmin)
+        don_flag = npx.logical_and(mask, don_initial > settings.trcmin)
+        diazotrophs_flag = npx.logical_and(mask, diazotrophs_initial > settings.trcmin)
+    else:
+        diazotrophs_flag = npx.zeros_like(mask, dtype="bool")
+
+    preference_sum = settings.zprefP + settings.zprefZ + settings.zprefDet
+    if settings.enable_nitrogen:
+        preference_sum += settings.zprefDiaz
+    zpref_p = settings.zprefP / preference_sum
+    zpref_z = settings.zprefZ / preference_sum
+    zpref_det = settings.zprefDet / preference_sum
+    zpref_diaz = settings.zprefDiaz / preference_sum
+
+    calcite_production = npx.zeros_like(phyto)
+    npp_sum = npx.zeros_like(phyto)
+    diazotroph_npp_sum = npx.zeros_like(phyto)
+    excretion_sum = npx.zeros_like(phyto)
+    remineralization_sum = npx.zeros_like(phyto)
+    export_sum = npx.zeros_like(phyto)
+    organic_dic_rate_sum = npx.zeros_like(phyto)
+    nitrogen_fixation_sum = npx.zeros_like(phyto)
+
+    for _ in range(n_substeps):
+        if settings.enable_nitrogen:
+            phosphorus_half_saturation = (
+                settings.saturation_constant_N * settings.redfield_ratio_PN
+            )
+            po4_limitation = po4 / (phosphorus_half_saturation + po4)
+            dop_limitation = (
+                settings.dop_uptake_efficiency
+                * dop
+                / (phosphorus_half_saturation + dop)
+            )
+            use_dop = npx.greater_equal(dop_limitation, po4_limitation)
+            phosphorus_limitation = npx.where(use_dop, dop_limitation, po4_limitation)
+            phosphorus_pool_flag = npx.where(use_dop, dop_flag, po4_flag)
+            no3_limitation = no3 / (settings.saturation_constant_N + no3)
+            growth_rate = npx.minimum(
+                average_light_growth,
+                npx.minimum(jmax * phosphorus_limitation, jmax * no3_limitation),
+            )
+            npp = growth_rate * phyto * phyto_flag * no3_flag * phosphorus_pool_flag
+            dop_uptake = npp * use_dop
+
+            growth_rate_diazotrophs = npx.minimum(
+                average_light_growth_diazotrophs,
+                jmax_diazotrophs * phosphorus_limitation,
+            )
+            diazotroph_npp = (
+                npx.maximum(0.0, growth_rate_diazotrophs * diazotrophs)
+                * diazotrophs_flag
+                * phosphorus_pool_flag
+            )
+            diazotroph_dop_uptake = diazotroph_npp * use_dop
+            diazotroph_no3_uptake = (
+                (0.5 + 0.5 * npx.tanh(no3 - 5.0)) * diazotroph_npp * no3_flag
+            )
+            nitrogen_fixation = diazotroph_npp - diazotroph_no3_uptake
+        else:
+            limitation = po4 / (
+                settings.saturation_constant_N * settings.redfield_ratio_PN + po4
+            )
+            growth_rate = npx.minimum(average_light_growth, jmax * limitation)
+            npp = growth_rate * phyto * phyto_flag * po4_flag
+            dop_uptake = npx.zeros_like(phyto)
+            diazotroph_npp = npx.zeros_like(phyto)
+            diazotroph_dop_uptake = npx.zeros_like(phyto)
+            diazotroph_no3_uptake = npx.zeros_like(phyto)
+            nitrogen_fixation = npx.zeros_like(phyto)
+
+        theta_z = zpref_p * phyto + zpref_det * detritus + zpref_z * zoo
+        if settings.enable_nitrogen:
+            theta_z = (
+                theta_z
+                + zpref_diaz * diazotrophs
+                + settings.saturation_constant_Z_grazing
+            )
+        else:
+            theta_z = (
+                theta_z
+                + settings.saturation_constant_Z_grazing * settings.redfield_ratio_PN
+            )
+        theta_z = npx.maximum(theta_z, settings.trcmin)
+
+        grazing_phyto = gmax * zpref_p / theta_z * phyto * zoo * phyto_flag * zoo_flag
+        grazing_zoo = gmax * zpref_z / theta_z * zoo * zoo * zoo_flag
+        grazing_detritus = (
+            gmax * zpref_det / theta_z * detritus * zoo * detritus_flag * zoo_flag
+        )
+        if settings.enable_nitrogen:
+            grazing_diazotrophs = (
+                gmax
+                * zpref_diaz
+                / theta_z
+                * diazotrophs
+                * zoo
+                * diazotrophs_flag
+                * zoo_flag
+            )
+            diazotroph_redfield_fraction = (
+                1.0 / settings.redfield_ratio_PN / settings.diazotroph_NP_ratio
+            )
+        else:
+            grazing_diazotrophs = npx.zeros_like(phyto)
+            diazotroph_redfield_fraction = 0.0
+
+        total_grazing = grazing_phyto + grazing_zoo + grazing_detritus
+        redfield_equivalent_grazing = (
+            total_grazing + grazing_diazotrophs * diazotroph_redfield_fraction
+        )
+        digestion = settings.assimilation_efficiency * redfield_equivalent_grazing
+        excretion = (1.0 - settings.zooplankton_growth_efficiency) * digestion
+        sloppy_feeding = (
+            1.0 - settings.assimilation_efficiency
+        ) * redfield_equivalent_grazing
+        non_redfield_diazotroph_excretion = grazing_diazotrophs * (
+            1.0 - diazotroph_redfield_fraction
+        )
+
+        phytoplankton_mortality = (
+            settings.specific_mortality_phytoplankton * phyto * phyto_flag
+        )
+        fast_recycling = fast_recycling_rate * phyto * phyto_flag
+        diazotroph_fast_recycling = (
+            fast_recycling_rate_diazotrophs * diazotrophs * diazotrophs_flag
+        )
+        diazotroph_mortality = (
+            settings.quadric_mortality_diazotrophs * diazotrophs**2 * diazotrophs_flag
+        )
+        zooplankton_mortality = (
+            settings.quadric_mortality_zooplankton * zoo**2 * zoo_flag
+        )
+        remineralization = detritus_remineralization_rate * detritus * detritus_flag
+        if settings.enable_nitrogen:
+            don_remineralization = (
+                settings.remineralization_rate_don * bct * don * don_flag
+            )
+            dop_remineralization = (
+                settings.remineralization_rate_dop * bct * dop * dop_flag
+            )
+        else:
+            don_remineralization = npx.zeros_like(phyto)
+            dop_remineralization = npx.zeros_like(phyto)
+
+        detritus_export = sinking_rate * detritus * detritus_flag
+        detritus_import = npx.zeros_like(detritus_export)
+        detritus_import = update(
+            detritus_import,
+            at[:, :, :-1],
+            detritus_export[:, :, 1:]
+            * vs.dzt[npx.newaxis, npx.newaxis, 1:]
+            / vs.dzt[npx.newaxis, npx.newaxis, :-1],
+        )
+        detritus_import = detritus_import * mask
+
+        phyto = phyto + dt_bio * (
+            npp - phytoplankton_mortality - grazing_phyto - fast_recycling
+        )
+        zoo = zoo + dt_bio * (
+            digestion - zooplankton_mortality - grazing_zoo - excretion
+        )
+        if settings.enable_nitrogen:
+            refractory_mortality = settings.refractory_fraction_phytoplankton_mortality
+            refractory_recycling = settings.refractory_fraction_phytoplankton_recycling
+            diazotroph_PN_ratio = 1.0 / settings.diazotroph_NP_ratio
+
+            detritus = detritus + dt_bio * (
+                (1.0 - refractory_mortality) * phytoplankton_mortality
+                + sloppy_feeding
+                + zooplankton_mortality
+                - remineralization
+                - grazing_detritus
+                - detritus_export
+                + detritus_import
+                + diazotroph_mortality * diazotroph_redfield_fraction
+            )
+            po4 = po4 + dt_bio * (
+                settings.redfield_ratio_PN
+                * (
+                    excretion
+                    + remineralization
+                    + (1.0 - refractory_recycling) * fast_recycling
+                    - (npp - dop_uptake)
+                )
+                + diazotroph_PN_ratio
+                * (diazotroph_fast_recycling - (diazotroph_npp - diazotroph_dop_uptake))
+                + dop_remineralization
+            )
+            dop = dop + dt_bio * (
+                settings.redfield_ratio_PN
+                * (
+                    refractory_mortality * phytoplankton_mortality
+                    + refractory_recycling * fast_recycling
+                    - dop_uptake
+                )
+                - diazotroph_PN_ratio * diazotroph_dop_uptake
+                - dop_remineralization
+            )
+            no3 = no3 + dt_bio * (
+                excretion
+                + remineralization
+                + (1.0 - refractory_recycling) * fast_recycling
+                - npp
+                + diazotroph_fast_recycling
+                - diazotroph_no3_uptake
+                + don_remineralization
+                + non_redfield_diazotroph_excretion
+                + diazotroph_mortality * (1.0 - diazotroph_redfield_fraction)
+            )
+            don = don + dt_bio * (
+                refractory_mortality * phytoplankton_mortality
+                + refractory_recycling * fast_recycling
+                - don_remineralization
+            )
+            diazotrophs = diazotrophs + dt_bio * (
+                diazotroph_npp
+                - diazotroph_mortality
+                - diazotroph_fast_recycling
+                - grazing_diazotrophs
+            )
+
+            organic_dic_rate = settings.redfield_ratio_CN * (
+                excretion
+                + remineralization
+                + (1.0 - refractory_recycling) * fast_recycling
+                - npp
+                + diazotroph_fast_recycling
+                - diazotroph_npp
+                + don_remineralization
+                + non_redfield_diazotroph_excretion
+                + diazotroph_mortality * (1.0 - diazotroph_redfield_fraction)
+            )
+        else:
+            detritus = detritus + dt_bio * (
+                phytoplankton_mortality
+                + sloppy_feeding
+                + zooplankton_mortality
+                - remineralization
+                - grazing_detritus
+                - detritus_export
+                + detritus_import
+            )
+            po4 = po4 + dt_bio * settings.redfield_ratio_PN * (
+                remineralization + excretion - npp + fast_recycling
+            )
+            organic_dic_rate = settings.redfield_ratio_CN * (
+                fast_recycling + excretion + remineralization - npp
+            )
+
+        organic_dic_rate_sum = organic_dic_rate_sum + organic_dic_rate
+
+        if settings.enable_carbon:
+            dic = dic + dt_bio * organic_dic_rate
+            # MOBI O_npzd_alk: organic carbon drawdown raises alkalinity.
+            alkalinity = (
+                alkalinity - dt_bio * organic_dic_rate / settings.redfield_ratio_CN
+            )
+            if settings.enable_implicit_calcite:
+                calpro = (
+                    (
+                        phytoplankton_mortality
+                        + zooplankton_mortality
+                        + (grazing_phyto + grazing_zoo)
+                        * (1.0 - settings.assimilation_efficiency)
+                    )
+                    * settings.capr
+                    * settings.redfield_ratio_CN
+                )
+                calcite_production = calcite_production + dt_bio * calpro
+                dic = dic - dt_bio * calpro
+                alkalinity = alkalinity - 2.0 * dt_bio * calpro
+
+        npp_sum = npp_sum + npp
+        diazotroph_npp_sum = diazotroph_npp_sum + diazotroph_npp
+        excretion_sum = excretion_sum + excretion
+        remineralization_sum = remineralization_sum + remineralization
+        export_sum = export_sum + detritus_export
+        nitrogen_fixation_sum = nitrogen_fixation_sum + nitrogen_fixation
+
+        # MOBI flags are irreversible within a tracer step: once a pool is
+        # depleted, its outgoing source terms remain disabled until the next
+        # Veros step.
+        phyto_flag = npx.logical_and(phyto_flag, phyto > settings.trcmin)
+        zoo_flag = npx.logical_and(zoo_flag, zoo > settings.trcmin)
+        detritus_flag = npx.logical_and(detritus_flag, detritus > settings.trcmin)
+        po4_flag = npx.logical_and(po4_flag, po4 > settings.trcmin)
+        if settings.enable_nitrogen:
+            no3_flag = npx.logical_and(no3_flag, no3 > settings.trcmin)
+            dop_flag = npx.logical_and(dop_flag, dop > settings.trcmin)
+            don_flag = npx.logical_and(don_flag, don > settings.trcmin)
+            diazotrophs_flag = npx.logical_and(
+                diazotrophs_flag, diazotrophs > settings.trcmin
+            )
+
+    # MOBI applies seafloor remineralization, denitrification, and oxygen
+    # coupling in ``mobi_driver`` after the biological substeps. Keeping that
+    # ordering also prevents freshly remineralized nutrients from feeding back
+    # into production during the same tracer step.
+    bottom_export_rate = export_sum / n_substeps * vs.bottom_mask
+    po4 = po4 + settings.dt_tracer * settings.redfield_ratio_PN * bottom_export_rate
+    mean_organic_dic_rate = (
+        organic_dic_rate_sum / n_substeps
+        + settings.redfield_ratio_CN * bottom_export_rate
+    )
+
+    if settings.enable_carbon:
+        dic = dic + settings.dt_tracer * settings.redfield_ratio_CN * bottom_export_rate
+        alkalinity = alkalinity - settings.dt_tracer * bottom_export_rate
+
+    if settings.enable_nitrogen:
+        benthic_denitrification = 0.06 + 0.19 * 0.99 ** (
+            npx.maximum(oxygen_initial, settings.trcmin)
+            - npx.maximum(no3_initial, settings.trcmin)
+        )
+        benthic_denitrification = (
+            benthic_denitrification
+            * npx.maximum(bottom_export_rate, settings.trcmin)
+            * settings.redfield_ratio_CN
+        )
+        benthic_denitrification = npx.minimum(
+            npx.maximum(benthic_denitrification, 0.0), bottom_export_rate
+        )
+        benthic_denitrification = (
+            benthic_denitrification
+            * (0.5 + 0.5 * npx.tanh(no3_initial * 10.0 - 5.0))
+            * npx.logical_and(mask, no3_initial > settings.trcmin)
+        )
+        no3 = no3 + settings.dt_tracer * (bottom_export_rate - benthic_denitrification)
+
+        nitrogen_fixation_rate = nitrogen_fixation_sum / n_substeps
+        oxygen_demand = (
+            mean_organic_dic_rate
+            * settings.redfield_ratio_ON
+            / settings.redfield_ratio_CN
+            + 1.25 * nitrogen_fixation_rate
+        )
+        water_column_denitrification = npx.maximum(
+            0.0,
+            0.8
+            * oxygen_demand
+            * (0.5 - 0.5 * npx.tanh(oxygen_initial - 2.5))
+            * (0.5 + 0.5 * npx.tanh(no3_initial - 2.5))
+            * npx.logical_and(mask, no3_initial > settings.trcmin),
+        )
+        no3 = no3 - settings.dt_tracer * water_column_denitrification
+        oxygen = oxygen - settings.dt_tracer * oxygen_demand * (
+            0.5 + 0.5 * npx.tanh(oxygen_initial - 2.5)
+        )
+
+        if settings.enable_carbon:
+            alkalinity = alkalinity + settings.dt_tracer * (
+                water_column_denitrification
+                + benthic_denitrification
+                - nitrogen_fixation_rate
+            )
+    else:
+        nitrogen_fixation_rate = npx.zeros_like(phyto)
+        water_column_denitrification = npx.zeros_like(phyto)
+        benthic_denitrification = npx.zeros_like(phyto)
+
+    out = dict(
+        phytoplankton_change=phyto - phyto_initial,
+        zooplankton_change=zoo - zoo_initial,
+        detritus_change=detritus - detritus_initial,
+        po4_change=po4 - po4_initial,
+        rctheta=rctheta,
+        dayfrac=dayfrac,
+        excretion_total=excretion_sum / n_substeps,
+        net_primary_production=(npp_sum + diazotroph_npp_sum) / n_substeps,
+        detritus_remineralization=remineralization_sum / n_substeps,
+        detritus_export=export_sum / n_substeps,
+    )
+
+    if settings.enable_nitrogen:
+        out.update(
+            no3_change=no3 - no3_initial,
+            dop_change=dop - dop_initial,
+            don_change=don - don_initial,
+            diazotrophs_change=diazotrophs - diazotrophs_initial,
+            oxygen_change=oxygen - oxygen_initial,
+            diazotroph_primary_production=diazotroph_npp_sum / n_substeps,
+            nitrogen_fixation=nitrogen_fixation_rate,
+            water_column_denitrification=water_column_denitrification,
+            benthic_denitrification=benthic_denitrification,
+        )
+
+    if settings.enable_carbon:
+        if settings.enable_implicit_calcite:
+            calcite_inventory = npx.sum(
+                calcite_production * vs.dzt[npx.newaxis, npx.newaxis, :], axis=2
+            )
+            dissolution = calcite_inventory[:, :, npx.newaxis] * vs.rcak
+            dic = dic + dissolution
+            alkalinity = alkalinity + 2.0 * dissolution
+
+        out.update(
+            dic_change=dic - dic_initial,
+            alkalinity_change=alkalinity - alkalinity_initial,
+        )
+
+    return KernelOutput(**out)
+
+
+def _evans_parslow_phi(u):
+    root = npx.sqrt(1.0 + u**2)
+    return npx.log(u + root) - (root - 1.0) / u
+
+
+@veros_kernel
+def transport_tracer(state, tracer, tendency, source_change):
+    """Apply Veros transport with BGC-specific advection and bounds handling."""
+
+    vs = state.variables
+    settings = state.settings
+
+    advective_tendency = advect_bgc_tracer(state, tracer[..., vs.tau])
+    tendency = update(tendency, at[..., vs.tau], advective_tendency)
+    tracer = update(
+        tracer,
+        at[..., vs.taup1],
+        tracer[..., vs.tau]
+        + settings.dt_tracer
+        * (
+            (1.5 + settings.AB_eps) * tendency[..., vs.tau]
+            - (0.5 + settings.AB_eps) * tendency[..., vs.taum1]
+        )
+        * vs.maskT,
+    )
+
+    if settings.enable_hor_diffusion:
+        horizontal_change, _, _ = diffusion.horizontal_diffusion(
+            state, tracer[..., vs.tau], settings.K_h
+        )
+        tracer = update_add(
+            tracer,
+            at[..., vs.taup1],
+            settings.dt_tracer * horizontal_change,
+        )
+
+    if settings.enable_biharmonic_mixing:
+        biharmonic_change, _, _ = diffusion.biharmonic_diffusion(
+            state, tracer[..., vs.tau], npx.sqrt(npx.abs(settings.K_hbi))
+        )
+        tracer = update_add(
+            tracer,
+            at[..., vs.taup1],
+            settings.dt_tracer * biharmonic_change,
+        )
+
+    if settings.enable_neutral_diffusion:
+        isoneutral_tendency = allocate(state.dimensions, ("xt", "yt", "zt"))
+        tracer, isoneutral_tendency, _, _, _ = isoneutral_diffusion_tracer(
+            state,
+            tracer,
+            isoneutral_tendency,
+            iso=True,
+            skew=False,
+        )
+        if settings.enable_skew_diffusion:
+            tracer, _, _, _, _ = isoneutral_diffusion_tracer(
+                state,
+                tracer,
+                isoneutral_tendency,
+                iso=False,
+                skew=True,
+            )
+
+    tracer = _vertical_mixing(state, tracer)
+    tracer = update_add(tracer, at[..., vs.taup1], source_change)
+    transported = tracer[..., vs.taup1]
+    if settings.enable_bgc_conservative_clipping:
+        transported = enforce_conservative_tracer_floor(state, transported)
+    else:
+        transported = npx.maximum(transported, settings.trcmin) * vs.maskT
+    tracer = update(
+        tracer,
+        at[..., vs.taup1],
+        transported,
+    )
+    tracer = update(
+        tracer,
+        at[..., vs.taup1],
+        utilities.enforce_boundaries(tracer[..., vs.taup1], settings.enable_cyclic_x),
+    )
+
+    return tracer, tendency
+
+
+@veros_kernel
+def advect_bgc_tracer(state, tracer):
+    """Return a conservative advection tendency for a MOBI tracer.
+
+    The physical four-degree setup intentionally retains its configured
+    temperature/salinity scheme.  MOBI tracers default to Superbee because
+    centered second-order advection creates negative plankton undershoots that
+    cannot be clipped without adding elemental inventory.
     """
 
-    a_tri = allocate(vs, ('xt', 'yt', 'zt'), include_ghosts=False)
-    b_tri = allocate(vs, ('xt', 'yt', 'zt'), include_ghosts=False)
-    c_tri = allocate(vs, ('xt', 'yt', 'zt'), include_ghosts=False)
-    d_tri = allocate(vs, ('xt', 'yt', 'zt'), include_ghosts=False)
-    delta = allocate(vs, ('xt', 'yt', 'zt'), include_ghosts=False)
+    vs = state.variables
+    settings = state.settings
 
-    ks = vs.kbot[2:-2, 2:-2] - 1
-    delta[:, :, :-1] = vs.dt_tracer / vs.dzw[np.newaxis, np.newaxis, :-1]\
-        * vs.kappaH[2:-2, 2:-2, :-1]
-    delta[:, :, -1] = 0
-    a_tri[:, :, 1:] = -delta[:, :, :-1] / vs.dzt[np.newaxis, np.newaxis, 1:]
-    b_tri[:, :, 1:] = 1 + (delta[:, :, 1:] + delta[:, :, :-1]) / vs.dzt[np.newaxis, np.newaxis, 1:]
-    b_tri_edge = 1 + delta / vs.dzt[np.newaxis, np.newaxis, :]
-    c_tri[:, :, :-1] = -delta[:, :, :-1] / vs.dzt[np.newaxis, np.newaxis, :-1]
+    if settings.enable_bgc_superbee_advection:
+        flux_east, flux_north, flux_top = advection.adv_flux_superbee(state, tracer)
+    else:
+        flux_east, flux_north, flux_top = advection.adv_flux_2nd(state, tracer)
 
-    for tracer in vs.npzd_transported_tracers:
-        tracer_data = vs.npzd_tracers[tracer]
+    tendency = allocate(state.dimensions, ("xt", "yt", "zt"))
+    tendency = update(
+        tendency,
+        at[2:-2, 2:-2, :],
+        vs.maskT[2:-2, 2:-2, :]
+        * (
+            -(flux_east[2:-2, 2:-2, :] - flux_east[1:-3, 2:-2, :])
+            / (
+                vs.cost[npx.newaxis, 2:-2, npx.newaxis]
+                * vs.dxt[2:-2, npx.newaxis, npx.newaxis]
+            )
+            - (flux_north[2:-2, 2:-2, :] - flux_north[2:-2, 1:-3, :])
+            / (
+                vs.cost[npx.newaxis, 2:-2, npx.newaxis]
+                * vs.dyt[npx.newaxis, 2:-2, npx.newaxis]
+            )
+        ),
+    )
+    tendency = update_add(
+        tendency,
+        at[:, :, 0],
+        -1.0 * vs.maskT[:, :, 0] * flux_top[:, :, 0] / vs.dzt[0],
+    )
+    tendency = update_add(
+        tendency,
+        at[:, :, 1:],
+        -1.0
+        * vs.maskT[:, :, 1:]
+        * (flux_top[:, :, 1:] - flux_top[:, :, :-1])
+        / vs.dzt[npx.newaxis, npx.newaxis, 1:],
+    )
+    return tendency
 
-        """
-        Advection of tracers
-        """
-        thermodynamics.advect_tracer(vs, tracer_data[:, :, :, vs.tau],
-                                     vs.npzd_advection_derivatives[tracer][:, :, :, vs.tau])
 
-        # Adam-Bashforth timestepping
-        tracer_data[:, :, :, vs.taup1] = tracer_data[:, :, :, vs.tau] + vs.dt_tracer \
-            * ((1.5 + vs.AB_eps) * vs.npzd_advection_derivatives[tracer][:, :, :, vs.tau]
-               - (0.5 + vs.AB_eps) * vs.npzd_advection_derivatives[tracer][:, :, :, vs.taum1])\
-            * vs.maskT
+@veros_kernel
+def enforce_conservative_tracer_floor(state, tracer):
+    """Apply ``trcmin`` while preserving every water-column inventory.
 
-        """
-        Diffusion of tracers
-        """
+    Numerical transport can leave tiny negative concentrations.  A direct
+    ``maximum`` creates tracer mass.  Here the clipped excess is removed
+    proportionally from concentrations above the floor in the same column.
+    The correction is therefore positive, horizontally local, and conservative
+    under the model's thickness-weighted inventory.
+    """
 
-        if vs.enable_hor_diffusion:
-            horizontal_diffusion_change = np.zeros_like(tracer_data[:, :, :, 0])
-            diffusion.horizontal_diffusion(vs, tracer_data[:, :, :, vs.tau],
-                                           horizontal_diffusion_change)
+    vs = state.variables
+    settings = state.settings
+    mask = vs.maskT
+    thickness = vs.dzt[npx.newaxis, npx.newaxis, :]
+    floor = settings.trcmin * mask
+    clipped = npx.maximum(tracer, settings.trcmin) * mask
+    excess = clipped - floor
 
-            tracer_data[:, :, :, vs.taup1] += vs.dt_tracer * horizontal_diffusion_change
+    raw_inventory = npx.sum(tracer * mask * thickness, axis=2)
+    floor_inventory = npx.sum(floor * thickness, axis=2)
+    excess_inventory = npx.sum(excess * thickness, axis=2)
+    target_excess = npx.maximum(raw_inventory - floor_inventory, 0.0)
+    scale = npx.where(
+        excess_inventory > 0.0,
+        target_excess / npx.maximum(excess_inventory, 1e-30),
+        0.0,
+    )
+    scale = npx.clip(scale, 0.0, 1.0)
 
-        if vs.enable_biharmonic_mixing:
-            biharmonic_diffusion_change = np.empty_like(tracer_data[:, :, :, 0])
-            diffusion.biharmonic(vs, tracer_data[:, :, :, vs.tau],
-                                 np.sqrt(abs(vs.K_hbi)), biharmonic_diffusion_change)
+    return (floor + excess * scale[:, :, npx.newaxis]) * mask
 
-            tracer_data[:, :, :, vs.taup1] += vs.dt_tracer * biharmonic_diffusion_change
 
-        """
-        Restoring zones
-        """
-        # TODO add restoring zones to general tracers
+@veros_kernel
+def _vertical_mixing(state, tracer):
+    vs = state.variables
+    settings = state.settings
 
-        """
-        Isopycnal diffusion
-        """
-        if vs.enable_neutral_diffusion:
-            dtracer_iso = np.zeros_like(tracer_data[..., 0])
+    a_tri = allocate(state.dimensions, ("xt", "yt", "zt"))[2:-2, 2:-2]
+    b_tri = allocate(state.dimensions, ("xt", "yt", "zt"))[2:-2, 2:-2]
+    c_tri = allocate(state.dimensions, ("xt", "yt", "zt"))[2:-2, 2:-2]
+    delta = allocate(state.dimensions, ("xt", "yt", "zt"))[2:-2, 2:-2]
 
-            isoneutral.isoneutral_diffusion_tracer(vs, tracer_data, dtracer_iso,
-                                                   iso=True, skew=False)
+    _, water_mask, edge_mask = utilities.create_water_masks(
+        vs.kbot[2:-2, 2:-2], settings.nz
+    )
+    delta = update(
+        delta,
+        at[:, :, :-1],
+        settings.dt_tracer
+        / vs.dzw[npx.newaxis, npx.newaxis, :-1]
+        * vs.kappaH[2:-2, 2:-2, :-1],
+    )
+    delta = update(delta, at[:, :, -1], 0.0)
+    a_tri = update(
+        a_tri,
+        at[:, :, 1:],
+        -delta[:, :, :-1] / vs.dzt[npx.newaxis, npx.newaxis, 1:],
+    )
+    b_tri = update(
+        b_tri,
+        at[:, :, 1:],
+        1.0
+        + (delta[:, :, 1:] + delta[:, :, :-1]) / vs.dzt[npx.newaxis, npx.newaxis, 1:],
+    )
+    b_tri_edge = 1.0 + delta / vs.dzt[npx.newaxis, npx.newaxis, :]
+    c_tri = update(
+        c_tri,
+        at[:, :, :-1],
+        -delta[:, :, :-1] / vs.dzt[npx.newaxis, npx.newaxis, :-1],
+    )
+    rhs = tracer[2:-2, 2:-2, :, vs.taup1]
+    solution = utilities.solve_implicit(
+        a_tri,
+        b_tri,
+        c_tri,
+        rhs,
+        water_mask,
+        edge_mask,
+        b_edge=b_tri_edge,
+    )
+    return update(
+        tracer,
+        at[2:-2, 2:-2, :, vs.taup1],
+        npx.where(water_mask, solution, rhs),
+    )
 
-            if vs.enable_skew_diffusion:
-                dtracer_skew = np.zeros_like(tracer_data[..., 0])
-                isoneutral.isoneutral_diffusion_tracer(vs, tracer_data, dtracer_skew,
-                                                       iso=False, skew=True)
-        """
-        Vertical mixing of tracers
-        """
-        d_tri[:, :, :] = tracer_data[2:-2, 2:-2, :, vs.taup1]
-        # TODO: surface flux?
-        # d_tri[:, :, -1] += surface_forcing
-        sol, mask = utilities.solve_implicit(vs, ks, a_tri, b_tri, c_tri, d_tri, b_edge=b_tri_edge)
 
-        tracer_data[2:-2, 2:-2, :, vs.taup1] = utilities.where(vs, mask, sol,
-                                                               tracer_data[2:-2, 2:-2, :, vs.taup1])
-
-    # update by biogeochemical changes
-    for tracer, change in npzd_changes.items():
-        vs.npzd_tracers[tracer][:, :, :, vs.taup1] += change
-
-    # prepare next timestep with minimum tracer values
-    for tracer in vs.npzd_tracers.values():
-        tracer[:, :, :, vs.taup1] = np.maximum(tracer[:, :, :, vs.taup1], vs.trcmin * vs.maskT)
-
-    for tracer in vs.npzd_tracers.values():
-        utilities.enforce_boundaries(vs, tracer)
+# Compatibility aliases retained for existing setup files.
+setupNPZD = setup_npzd
+biogeochemistry = mobi_biology

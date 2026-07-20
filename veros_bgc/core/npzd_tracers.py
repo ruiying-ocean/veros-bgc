@@ -1,12 +1,12 @@
 """
 Classes for npzd tracers
 """
+
 import numpy as np
 
-from veros import veros_method
 
 class NPZD_tracer(np.ndarray):
-    """ Class for npzd tracers to store additional information about themselves.
+    """Class for npzd tracers to store additional information about themselves.
 
     Note
     ----
@@ -47,9 +47,15 @@ class NPZD_tracer(np.ndarray):
         If set: Factor for how much light is blocked
     """
 
-
-    def __new__(cls, input_array, name, sinking_speed=None, light_attenuation=None, transport=True,
-                description = None):
+    def __new__(
+        cls,
+        input_array,
+        name,
+        sinking_speed=None,
+        light_attenuation=None,
+        transport=True,
+        description=None,
+    ):
         obj = np.asarray(input_array).view(cls)
         if sinking_speed is not None:
             obj.sinking_speed = sinking_speed
@@ -68,12 +74,12 @@ class NPZD_tracer(np.ndarray):
         # If we are slicing, obj will have __dir__ therefore we need to set attributes
         # on new sliced array
         if hasattr(obj, "__dir__"):
-            for attribute in (set(dir(obj)) - set(dir(self))):
+            for attribute in set(dir(obj)) - set(dir(self)):
                 setattr(self, attribute, getattr(obj, attribute))
 
 
 class Recyclable_tracer(NPZD_tracer):
-    """ A recyclable tracer
+    """A recyclable tracer
 
     This would be tracer, which may be a tracer like detritus, which can be recycled
 
@@ -105,7 +111,6 @@ class Recyclable_tracer(NPZD_tracer):
 
         return obj
 
-    @veros_method(inline=True)
     def recycle(self, vs):
         """
         Recycling is temperature dependant by :obj:`vs.bct`
@@ -114,7 +119,7 @@ class Recyclable_tracer(NPZD_tracer):
 
 
 class Plankton(Recyclable_tracer):
-    """ Class for plankton object, which is both recyclable and displays mortality
+    """Class for plankton object, which is both recyclable and displays mortality
 
     This class is intended as a base for phytoplankton and zooplankton and not
     as a standalone class
@@ -151,7 +156,6 @@ class Plankton(Recyclable_tracer):
         obj.mortality_rate = mortality_rate
         return obj
 
-    @veros_method(inline=True)
     def mortality(self, vs):
         """
         The mortality rate scales linearly with population size
@@ -160,7 +164,7 @@ class Plankton(Recyclable_tracer):
 
 
 class Phytoplankton(Plankton):
-    """ Phytoplankton also has primary production
+    """Phytoplankton also has primary production
 
     Parameters
     ----------
@@ -190,19 +194,19 @@ class Phytoplankton(Plankton):
 
         return obj
 
-    @veros_method(inline=True)
     def potential_growth(self, vs, grid_light, light_attenuation):
-        """ Light limited growth, not limited growth """
+        """Light limited growth, not limited growth"""
         f1 = np.exp(-light_attenuation)  # available light
         jmax = self.growth_parameter * vs.bct  # maximum growth
         gd = jmax * vs.dayfrac[np.newaxis, :, np.newaxis]  # growth in fraction of day
-        avej = self._avg_J(vs, f1, gd, grid_light, light_attenuation)  # light limited growth
+        avej = self._avg_J(
+            vs, f1, gd, grid_light, light_attenuation
+        )  # light limited growth
 
         return jmax, avej
 
-    @veros_method(inline=True)
     def _avg_J(self, vs, f1, gd, grid_light, light_attenuation):
-        """ Average light over a triuneral cycle
+        """Average light over a triuneral cycle
 
         Note
         ----
@@ -219,7 +223,9 @@ class Phytoplankton(Plankton):
 
 
 class Zooplankton(Plankton):
-    """ Zooplankton displays quadratic mortality rate but otherwise is similar to ordinary phytoplankton
+    """Zooplankton displays quadratic mortality.
+
+    Otherwise it is similar to ordinary phytoplankton.
 
     Parameters
     ----------
@@ -273,10 +279,18 @@ class Zooplankton(Plankton):
     + All attributes held by super class
     """
 
-    def __new__(cls, input_array, name, max_grazing=0, grazing_saturation_constant=1,
-                grazing_preferences={}, assimilation_efficiency=0,
-                growth_efficiency=0,
-                maximum_growth_temperature=20, **kwargs):
+    def __new__(
+        cls,
+        input_array,
+        name,
+        max_grazing=0,
+        grazing_saturation_constant=1,
+        grazing_preferences={},
+        assimilation_efficiency=0,
+        growth_efficiency=0,
+        maximum_growth_temperature=20,
+        **kwargs,
+    ):
         obj = super().__new__(cls, input_array, name, **kwargs)
 
         obj.max_grazing = max_grazing
@@ -289,22 +303,20 @@ class Zooplankton(Plankton):
 
         return obj
 
-    @veros_method(inline=True)
     def update_internal(self, vs):
         """
         Updates internal numbers, which are calculated only from Veros values
         """
-        self._gmax = self.max_grazing * vs.bbio ** (vs.cbio *
-                     np.minimum(self.maximum_growth_temperature, vs.temp[..., vs.tau]))
+        self._gmax = self.max_grazing * vs.bbio ** (
+            vs.cbio * np.minimum(self.maximum_growth_temperature, vs.temp[..., vs.tau])
+        )
 
-    @veros_method(inline=True)
     def mortality(self, vs):
         """
         Zooplankton is modelled with a quadratic mortality
         """
-        return self.mortality_rate * self ** 2
+        return self.mortality_rate * self**2
 
-    @veros_method(inline=True)
     def grazing(self, vs, tracers, flags):
         """
         Zooplankton grazing on set preys
@@ -329,26 +341,48 @@ class Zooplankton(Plankton):
 
         Note
         ----
-        thetaZ is scaled by vs.redfield_ratio_PN. This may not be desirable in the general case
+        thetaZ is scaled by vs.redfield_ratio_PN. This may not be desirable in
+        the general case.
         """
 
-        thetaZ = sum([pref_score * tracers[preference] for preference, pref_score
-                      in self.grazing_preferences.items()])\
-                 + vs.saturation_constant_Z_grazing * vs.redfield_ratio_PN
+        thetaZ = (
+            sum(
+                [
+                    pref_score * tracers[preference]
+                    for preference, pref_score in self.grazing_preferences.items()
+                ]
+            )
+            + vs.saturation_constant_Z_grazing * vs.redfield_ratio_PN
+        )
 
-        ingestion = {preference: pref_score / thetaZ for preference, pref_score in self.grazing_preferences.items()}
+        ingestion = {
+            preference: pref_score / thetaZ
+            for preference, pref_score in self.grazing_preferences.items()
+        }
 
-        grazing = {preference: flags[preference] * flags[self.name] * self._gmax *
-                   ingestion[preference] * tracers[preference] * self
-                   for preference in ingestion}
+        grazing = {
+            preference: flags[preference]
+            * flags[self.name]
+            * self._gmax
+            * ingestion[preference]
+            * tracers[preference]
+            * self
+            for preference in ingestion
+        }
 
-        digestion = {preference: self.assimilation_efficiency * amount_grazed
-                     for preference, amount_grazed in grazing.items()}
+        digestion = {
+            preference: self.assimilation_efficiency * amount_grazed
+            for preference, amount_grazed in grazing.items()
+        }
 
-        excretion = {preference: (1 - self.growth_efficiency) * amount_digested
-                     for preference, amount_digested in digestion.items()}
+        excretion = {
+            preference: (1 - self.growth_efficiency) * amount_digested
+            for preference, amount_digested in digestion.items()
+        }
 
-        sloppy_feeding = {preference: grazing[preference] - digestion[preference]
-                          for preference in grazing}
+        sloppy_feeding = {
+            preference: grazing[preference] - digestion[preference]
+            for preference in grazing
+        }
 
         return grazing, digestion, excretion, sloppy_feeding

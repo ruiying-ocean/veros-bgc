@@ -1,0 +1,81 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "veros-bgc"
+version = "0.1.4.dev0"
+description = "Biogeochemistry plugin for Veros implementing the MOBI ecosystem model."
+readme = "README.md"
+requires-python = ">=3.14,<3.15"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Dion Häfner (NBI Copenhagen)", email = "dion.haefner@nbi.ku.dk" },
+]
+keywords = [
+  "biogeochemistry",
+  "MOBI",
+  "oceanography",
+  "Veros",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX",
+  "Operating System :: Unix",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Topic :: Scientific/Engineering",
+]
+dependencies = [
+  "h5netcdf>=1.0",
+  "veros>=1.6.2",
+]
+
+[project.urls]
+Documentation = "https://veros-bgc.readthedocs.io"
+Repository = "https://github.com/team-ocean/veros-bgc"
+
+[project.entry-points."veros.setup_dirs"]
+bgc = "veros_bgc.setup"
+
+[dependency-groups]
+dev = [
+  "matplotlib>=3.8",
+  "pytest>=8",
+  "ruff>=0.9",
+]
+docs = [
+  "Sphinx>=7",
+  "sphinx-rtd-theme>=2",
+  "sphinxcontrib-programoutput>=0.18",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+python-preference = "only-managed"
+
+[tool.setuptools.packages.find]
+include = ["veros_bgc*"]
+
+[tool.setuptools.package-data]
+veros_bgc = [
+  "setup/*/assets.json",
+  "setup/*/*.npy",
+  "setup/*/*.png",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py314"
+extend-exclude = ["doc/_3rdparty", "doc/conf.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]

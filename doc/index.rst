@@ -1,14 +1,16 @@
 :tocdepth: 5
 
-.. warning::
-
-   Veros-BGC is not yet compatible with Veros v1.x.x. The last compatible version is `v0.2.3 <https://veros.readthedocs.io/en/v0.2.3/>`_.
-
-
 A biogeochemistry module for Veros
 ==================================
 
-Veros-BGC adds a full-fledged NPZD (Nutrients-Phytoplankton-Zooplankton-Detritus) loop on top of the `Veros <https://readthedocs.io/veros>`_ ocean model, with support for custom tracers and additional rules.
+Veros-BGC adds a MOBI nutrients--phytoplankton--zooplankton--detritus (NPZD)
+model to `Veros <https://veros.readthedocs.io>`_. It uses the current Veros
+state, plugin, diagnostic, NumPy, and JAX APIs.
+
+The implemented scientific scope is MOBI's ``O_npzd`` branch, its coupled
+``O_npzd_nitrogen`` and ``O_npzd_o2`` branches, and optional DIC, alkalinity,
+air--sea CO2 exchange, and implicit calcite redistribution. Iron, prognostic
+CaCO3 and coccolithophores, and isotope branches are not implemented yet.
 
 Veros-BGC is based on `MOBI <http://people.oregonstate.edu/~schmita2/Models/MOBI/index.html>`_ by `Andreas Schmittner <http://people.oregonstate.edu/~schmita2/>`_, Oregon State University.
 
@@ -34,5 +36,5 @@ Veros-BGC is based on `MOBI <http://people.oregonstate.edu/~schmita2/Models/MOBI
    :maxdepth: 2
    :caption: More Information
 
-   Veros core documentation <https://readthedocs.io/veros>
+   Veros core documentation <https://veros.readthedocs.io>
    Visit us on GitHub <https://github.com/team-ocean/veros-bgc>

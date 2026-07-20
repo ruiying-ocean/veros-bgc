@@ -1,170 +1,139 @@
-from loguru import logger
+"""Conservation diagnostics for MOBI tracers."""
 
-from veros.diagnostics.diagnostic import VerosDiagnostic
-from veros import veros_method
+from veros import logger
+from veros.core.operators import numpy as npx
+from veros.diagnostics.base import VerosDiagnostic
+from veros.distributed import global_sum
+from veros.variables import Variable
 
 
 class NPZDMonitor(VerosDiagnostic):
-    """Diagnostic monitoring nutrients and plankton concentrations
-    """
+    """Monitor global phosphorus, nitrogen, and carbon inventories."""
 
-    name = 'npzd'  #:
-    output_frequency = None  #: Frequency (in seconds) in which output is written
-    restart_attributes = []
-    save_graph = False  #: Whether or not to save a graph of the selected dynamics
-    graph_attr = {  #: Properties of the graph (graphviz)
-        'splines': 'ortho',
-        'center': 'true',
-        'nodesep': '0.05',
-        'node': 'square'
-    }
+    name = "npzd"
+    output_frequency = None
+    sampling_frequency = 0.0
 
-    def __init__(self, setup):
-        self.output_variables = []
-        self.surface_out = []
-        self.bottom_out = []
-        self.po4_total = 0
-        self.dic_total = 0
+    def __init__(self, state=None):
+        # Current Veros instantiates plugin diagnostics without passing state;
+        # accepting it remains useful for forwards compatibility.
+        self.var_meta = {
+            "po4_total": Variable(
+                "Previous phosphorus inventory", None, "mmol P", write_to_restart=True
+            ),
+            "dic_total": Variable(
+                "Previous carbon inventory", None, "mmol C", write_to_restart=True
+            ),
+            "nitrogen_total": Variable(
+                "Previous nitrogen inventory", None, "mmol N", write_to_restart=True
+            ),
+        }
 
-    @veros_method
-    def initialize(self, vs):
-        cell_volume = vs.area_t[2:-2, 2:-2, np.newaxis] * vs.dzt[np.newaxis, np.newaxis, :] * vs.maskT[2:-2, 2:-2, :]
+    def initialize(self, state):
+        self.initialize_variables(state)
+        phosphorus, nitrogen, carbon = _global_inventories(state)
+        self.variables.po4_total = phosphorus
+        self.variables.nitrogen_total = nitrogen
+        self.variables.dic_total = carbon
 
-        po4_sum = vs.phytoplankton[2:-2, 2:-2, :, vs.tau] * vs.redfield_ratio_PN\
-                  + vs.detritus[2:-2, 2:-2, :, vs.tau] * vs.redfield_ratio_PN\
-                  + vs.zooplankton[2:-2, 2:-2, :, vs.tau] * vs.redfield_ratio_PN\
-                  + vs.po4[2:-2, 2:-2, :, vs.tau]
-
-        self.po4_total = np.sum(po4_sum * cell_volume)
-
-        if vs.enable_carbon:
-            dic_sum = vs.phytoplankton[2:-2, 2:-2, :, vs.tau] * vs.redfield_ratio_CN\
-                      + vs.detritus[2:-2, 2:-2, :, vs.tau] * vs.redfield_ratio_CN\
-                      + vs.zooplankton[2:-2, 2:-2, :, vs.tau] * vs.redfield_ratio_CN\
-                      + vs.dic[2:-2, 2:-2, :, vs.tau]
-
-            self.dic_total = np.sum(dic_sum * cell_volume)
-
-    def diagnose(self, vs):
+    def diagnose(self, state):
         pass
 
-    @veros_method
-    def output(self, vs):
-        """Print NPZD interaction graph
-        """
-        if self.save_graph:
-            from graphviz import Digraph
-            npzd_graph = Digraph('npzd_dynamics', filename='npzd_dynamics.gv')
-            label_prefix = '\\tiny '  # should be selectable in settings allows for better exporting to tex
-            label_prefix = ''
+    def output(self, state):
+        phosphorus, nitrogen, carbon = _global_inventories(state)
 
-            # Create a node for all selected tracers
-            # Drawing edges also creates nodes, so this just ensures, we se it,
-            # when there are no connections to a node
-            for tracer, tracer_data in vs.npzd_tracers.items():
-                npzd_graph.node(tracer)
+        old_phosphorus = self.variables.po4_total
+        phosphorus_change = npx.where(
+            old_phosphorus != 0.0,
+            (phosphorus - old_phosphorus) / old_phosphorus,
+            0.0,
+        )
+        logger.diagnostic(
+            f" Total phosphorus: {phosphorus:.8e} mmol; "
+            f"relative change: {phosphorus_change:.3e}"
+        )
+        self.variables.po4_total = phosphorus
 
-                # If a tracer has the sinking_speed attribute indicate on the graph
-                if hasattr(tracer_data, 'sinking_speed'):
-                    npzd_graph.node('Bottom', shape='square')
-                    npzd_graph.edge(tracer, 'Bottom', label=label_prefix + 'sinking', lblstyle='sloped,above')
+        if state.settings.enable_nitrogen:
+            old_nitrogen = self.variables.nitrogen_total
+            nitrogen_change = npx.where(
+                old_nitrogen != 0.0,
+                (nitrogen - old_nitrogen) / old_nitrogen,
+                0.0,
+            )
+            logger.diagnostic(
+                f" Total ocean nitrogen: {nitrogen:.8e} mmol; "
+                f"relative change: {nitrogen_change:.3e}"
+            )
+            self.variables.nitrogen_total = nitrogen
 
-            # Common source rules are split up into several rules
-            # This causes a duplication of the first registerd rule
-            # Which should not be shown, so if there is more than one of them selected,
-            # The source edge should not be displayed, because it is already there
-            skiprules = []
-            for name, rule in vs.common_source_rules.items():
-                # Construct the list of rule names
-                rule_names = [name + '_' + rule[0][1]] + [name + '_' + rule[i][2] for i in range(1, len(rule))]
+        if state.settings.enable_carbon:
+            old_carbon = self.variables.dic_total
+            carbon_change = npx.where(
+                old_carbon != 0.0,
+                (carbon - old_carbon) / old_carbon,
+                0.0,
+            )
+            logger.diagnostic(
+                f" Total ocean carbon: {carbon:.8e} mmol; "
+                f"relative change: {carbon_change:.3e}"
+            )
+            self.variables.dic_total = carbon
 
-                # If there is more than one indicate, that it should be skipped from drawing
-                if len(rule_names) > 1:
-                    skiprules.append(vs.npzd_available_rules[rule_names[0]])
 
-            # Draw primary rules
-            for rule in vs.npzd_rules:
-                if rule in skiprules:
-                    continue
+def _global_inventories(state):
+    vs = state.variables
+    settings = state.settings
 
-                npzd_graph.edge(rule.source, rule.sink, label=label_prefix + rule.label, lblstyle='sloped, above')
+    cell_volume = (
+        vs.area_t[2:-2, 2:-2, npx.newaxis]
+        * vs.dzt[npx.newaxis, npx.newaxis, :]
+        * vs.maskT[2:-2, 2:-2, :]
+    )
+    redfield_organic_nitrogen = (
+        vs.phytoplankton[2:-2, 2:-2, :, vs.tau]
+        + vs.zooplankton[2:-2, 2:-2, :, vs.tau]
+        + vs.detritus[2:-2, 2:-2, :, vs.tau]
+    )
+    if settings.enable_nitrogen:
+        diazotrophs = vs.diazotrophs[2:-2, 2:-2, :, vs.tau]
+        phosphorus_field = (
+            vs.po4[2:-2, 2:-2, :, vs.tau]
+            + vs.dop[2:-2, 2:-2, :, vs.tau]
+            + settings.redfield_ratio_PN * redfield_organic_nitrogen
+            + diazotrophs / settings.diazotroph_NP_ratio
+        )
+        nitrogen_field = (
+            vs.no3[2:-2, 2:-2, :, vs.tau]
+            + vs.don[2:-2, 2:-2, :, vs.tau]
+            + redfield_organic_nitrogen
+            + diazotrophs
+        )
+        carbon_organic_nitrogen = (
+            redfield_organic_nitrogen + diazotrophs + vs.don[2:-2, 2:-2, :, vs.tau]
+        )
+    else:
+        phosphorus_field = (
+            vs.po4[2:-2, 2:-2, :, vs.tau]
+            + settings.redfield_ratio_PN * redfield_organic_nitrogen
+        )
+        nitrogen_field = npx.zeros_like(phosphorus_field)
+        carbon_organic_nitrogen = redfield_organic_nitrogen
 
-            # Draw pre rules dotted
-            for rule in vs.npzd_pre_rules:
-                if rule in skiprules:
-                    continue
+    phosphorus = global_sum(npx.sum(phosphorus_field * cell_volume))
+    nitrogen = global_sum(npx.sum(nitrogen_field * cell_volume))
 
-                npzd_graph.edge(rule.source, rule.sink, label=label_prefix + rule.label, style='dotted', lblstyle='sloped, above')
+    if settings.enable_carbon:
+        carbon = global_sum(
+            npx.sum(
+                (
+                    vs.dic[2:-2, 2:-2, :, vs.tau]
+                    + settings.redfield_ratio_CN * carbon_organic_nitrogen
+                )
+                * cell_volume
+            )
+        )
+    else:
+        carbon = npx.asarray(0.0)
 
-            # Draw post rules dashed
-            for rule in vs.npzd_post_rules:
-                if rule in skiprules:
-                    continue
-
-                npzd_graph.edge(rule.source, rule.sink, label=label_prefix + rule.label, style='dashed', lblstyle='sloped, above')
-
-            self.save_graph = False
-            npzd_graph.render('npzd_graph', view=False)
-
-        """
-        Total phosphorus should be (approximately) constant
-        """
-        cell_volume = vs.area_t[2:-2, 2:-2, np.newaxis] * vs.dzt[np.newaxis, np.newaxis, :] * vs.maskT[2:-2, 2:-2, :]
-
-        po4_sum = vs.phytoplankton[2:-2, 2:-2, :, vs.tau] * vs.redfield_ratio_PN\
-                  + vs.detritus[2:-2, 2:-2, :, vs.tau] * vs.redfield_ratio_PN\
-                  + vs.zooplankton[2:-2, 2:-2, :, vs.tau] * vs.redfield_ratio_PN\
-                  + vs.po4[2:-2, 2:-2, :, vs.tau]
-
-        if vs.enable_carbon:
-            dic_sum = vs.phytoplankton[2:-2, 2:-2, :, vs.tau] * vs.redfield_ratio_CN\
-                      + vs.detritus[2:-2, 2:-2, :, vs.tau] * vs.redfield_ratio_CN\
-                      + vs.zooplankton[2:-2, 2:-2, :, vs.tau] * vs.redfield_ratio_CN\
-                      + vs.dic[2:-2, 2:-2, :, vs.tau]
-
-        po4_total = np.sum(po4_sum * cell_volume)
-        logger.diagnostic(' total phosphorus: {}, relative change: {}'.format(po4_total, (po4_total - self.po4_total)/self.po4_total))
-        self.po4_total = po4_total[...]
-
-        if vs.enable_carbon:
-            dic_total = np.sum(dic_sum * cell_volume)
-            logger.diagnostic(' total DIC: {}, relative change: {}'.format(dic_total, (dic_total - self.dic_total)/self.dic_total))
-            self.dic_total = dic_total.copy()
-
-        for var in self.output_variables:
-            if var in vs.recycled:
-                recycled_total = np.sum(vs.recycled[var][2:-2, 2:-2, :] * cell_volume)
-            else:
-                recycled_total = 0
-
-            if var in vs.mortality:
-                mortality_total = np.sum(vs.mortality[var][2:-2, 2:-2, :] * cell_volume)
-            else:
-                mortality_total = 0
-
-            if var in vs.net_primary_production:
-                npp_total = np.sum(vs.net_primary_production[var][2:-2, 2:-2, :] * cell_volume)
-            else:
-                npp_total = 0
-
-            if var in vs.grazing:
-                grazing_total = np.sum(vs.grazing[var][2:-2, 2:-2, :] * cell_volume)
-            else:
-                grazing_total = 0
-
-            logger.diagnostic(' total recycled {}: {}'.format(var, recycled_total))
-            logger.diagnostic(' total mortality {}: {}'.format(var, mortality_total))
-            logger.diagnostic(' total npp {}: {}'.format(var, npp_total))
-            logger.diagnostic(' total grazed {}: {}'.format(var, grazing_total))
-
-        for var in self.surface_out:
-            logger.diagnostic(' mean {} surface concentration: {} mmol/m^3'.format(var, vs.npzd_tracers[var][vs.maskT[:, :, -1]].mean()))
-
-        for var in self.bottom_out:
-            logger.diagnostic(' mean {} bottom concentration: {} mmol/m^3'.format(var, vs.npzd_tracers[var][vs.bottom_mask].mean()))
-
-    def read_restart(self, vs, infile):
-        pass
-
-    def write_restart(self, vs, outfile):
-        pass
+    return phosphorus, nitrogen, carbon

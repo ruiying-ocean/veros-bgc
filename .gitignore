@@ -75,9 +75,6 @@ target/
 # Jupyter Notebook
 .ipynb_checkpoints
 
-# pyenv
-.python-version
-
 # celery beat schedule file
 celerybeat-schedule
 
@@ -87,6 +84,8 @@ celerybeat-schedule
 # Environments
 .env
 .venv
+.uv-cache/
+.uv-python/
 env/
 venv/
 ENV/
@@ -108,3 +107,7 @@ venv.bak/
 
 # VS Code
 .vscode
+
+# Generated model output and plots
+results/
+figures/

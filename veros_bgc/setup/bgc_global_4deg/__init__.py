@@ -1,1 +1,3 @@
 from veros_bgc.setup.bgc_global_4deg.bgc_global_four_degree import GlobalFourDegreeBGC
+
+__all__ = ("GlobalFourDegreeBGC",)

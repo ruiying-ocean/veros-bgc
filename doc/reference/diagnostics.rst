@@ -3,7 +3,8 @@
 Biogeochemistry diagnostic
 --------------------------
 
-This module monitors total phosphate and produces interaction graphs for the biogeochemistry module
+This diagnostic monitors globally integrated phosphorus, nitrogen, and carbon
+inventories. Its previous inventory is included in Veros restart files.
 
 .. autoclass:: veros_bgc.diagnostics.npzd_monitor.NPZDMonitor
-   :members: name, output_frequency, save_graph
+   :members: name, output_frequency

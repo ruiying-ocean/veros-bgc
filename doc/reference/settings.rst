@@ -6,7 +6,7 @@ Available settings
   for key, sett in SETTINGS.items():
       print(".. _setting-{}:".format(key))
       print("")
-      print(".. py:attribute:: VerosState.{} = {}".format(key, sett.default))
+      print(".. py:attribute:: VerosState.settings.{} = {}".format(key, sett.default))
       print("")
       print("   {}".format(sett.description))
       print("")

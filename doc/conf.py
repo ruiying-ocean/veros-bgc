@@ -19,6 +19,7 @@
 
 import os
 import sys
+
 sys.path.insert(0, os.path.abspath('..'))
 sys.path.insert(0, os.path.abspath('_3rdparty'))
 
@@ -31,7 +32,6 @@ sys.path.insert(0, os.path.abspath('_3rdparty'))
 # Add any Sphinx extension module names here, as strings. They can be
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
 # ones.
-import sphinx_fontawesome
 
 extensions = [
     'sphinx.ext.autodoc',

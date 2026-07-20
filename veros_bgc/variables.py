@@ -1,87 +1,352 @@
-from collections import OrderedDict
+"""Variable metadata for the Veros-BGC plugin."""
 
-from veros.variables import Variable, T_GRID, T_HOR, YT, TIMESTEPS
+from veros.variables import T_GRID, T_HOR, TIMESTEPS, YT, Variable
 
 
-MAIN_VARIABLES = OrderedDict([])
+def _npzd(settings):
+    return settings.enable_npzd
 
-CONDITIONAL_VARIABLES = OrderedDict([
-    ('enable_npzd', OrderedDict([
-        ('bottom_mask', Variable(
-            'Bottom mask', T_GRID, '', 'Bottom mask', dtype='int8'
-        )),
-        ('phytoplankton', Variable(
-            'Phytoplankton concentration', T_GRID + TIMESTEPS, 'mmol/m^3?',
-            'Concentration of phytoplankton in grid box',
-            output=True,
-            write_to_restart=True
-        )),
-        ('zooplankton', Variable(
-            'Zooplankton concentration', T_GRID + TIMESTEPS, 'mmol/m^3?',
-            'Concentration of zooplankton in grid box',
-            output=True,
-            write_to_restart=True
-        )),
-        ('detritus', Variable(
-            'Detritus concentration', T_GRID + TIMESTEPS, 'mmol/m^3?',
-            'Concentration of detritus in grid box',
-            output=True,
-            write_to_restart=True
-        )),
-        ('po4', Variable(
-            'Phosphate concentration', T_GRID + TIMESTEPS, 'mmol/m^3?',
-            'Concentration of phosphate in grid box',
-            output=True,
-            write_to_restart=True
-        )),
-        ('swr', Variable(
-            'Shortwave radiation', T_HOR, 'W/m^3?',
-            'Incomming solar radiation at sea level')),
-        ('rctheta', Variable(
-            'Effective vertical coordinate for incoming solar radiation', YT, '1',
-            'Effective vertical coordinate for incoming solar radiation')),
-        ('dayfrac', Variable(
-            'Fraction of day with sunlight', YT, '1',
-            'Fraction of day with sunlight')),
-        ('excretion_total', Variable(
-            'Total excretion from zooplankton', T_GRID, 'mmol/m^3 / s',
-            'Zooplankton grazing causes excretion. This stores the total excreted amount for all consumed tracers')),
-    ])),
-    ('enable_carbon', OrderedDict([
-        ('dic', Variable(
-            'Dissolved Inorganic Carbon', T_GRID + TIMESTEPS, 'mmol/m^3',
-            'Concentration of inorganic carbon ions and molecule',
-            output=True,
-            write_to_restart=True,
-        )),
-        ('alkalinity', Variable(
-            'Alkalinity', T_GRID + TIMESTEPS, 'mmol/m^3',
-            'Combined bases and acids',
-            output=True,
-            write_to_restart=True
-        )),
-        ('atmospheric_co2', Variable(
-            'Atmospheric co2 concentration', T_HOR, 'ppmv',
-            'Atmospheric co2 concentration')),
-        ('cflux', Variable(
-            'DIC Flux', T_HOR, 'mmol/m^2/s',
-            'Flux of CO2 over the ocean-atmosphere bounday',
-            output=True)),
-        ('wind_speed', Variable(
-            'Debugging wind speed', T_HOR, 'm/s',
-            'Just used for debugging. Please ignore',
-            output=True)),
-        ('hSWS', Variable('hSWS', T_HOR, '1',
-                          '[H] in Sea water sample', output=True)),
-        ('pCO2', Variable('pCO2', T_HOR, '?ppmv/atm?',
-                          'Partial CO2 pressure', output=True)),
-        ('dpCO2', Variable('dpCO2', T_HOR, '?ppmv/atm?',
-                           'Difference in ocean CO2 pressure and atmospheric', output=True)),
-        ('co2star', Variable('co2star', T_HOR, '?ppmv?',
-                             'Adjusted CO2 in ocean', output=True)),
-        ('dco2star', Variable('dco2star', T_HOR, '?ppmv?',
-                              'Adjusted CO2 difference', output=True)),
-        ('rcak', Variable('Calcite redistribution share', T_GRID, '1',
-                          'Calcite is redistributed after production by dissolution varying by depth')),
-    ])),
-])
+
+def _carbon(settings):
+    return settings.enable_npzd and settings.enable_carbon
+
+
+def _nitrogen(settings):
+    return settings.enable_npzd and settings.enable_nitrogen
+
+
+VARIABLES = {
+    "bottom_mask": Variable(
+        "Bottom mask",
+        T_GRID,
+        "1",
+        "True in the deepest wet cell of each water column",
+        dtype="bool",
+        time_dependent=False,
+        active=_npzd,
+    ),
+    "phytoplankton": Variable(
+        "Phytoplankton concentration",
+        T_GRID + TIMESTEPS,
+        "mmol N / m3",
+        "MOBI phytoplankton concentration",
+        write_to_restart=True,
+        active=_npzd,
+    ),
+    "zooplankton": Variable(
+        "Zooplankton concentration",
+        T_GRID + TIMESTEPS,
+        "mmol N / m3",
+        "MOBI zooplankton concentration",
+        write_to_restart=True,
+        active=_npzd,
+    ),
+    "detritus": Variable(
+        "Detritus concentration",
+        T_GRID + TIMESTEPS,
+        "mmol N / m3",
+        "MOBI sinking detritus concentration",
+        write_to_restart=True,
+        active=_npzd,
+    ),
+    "po4": Variable(
+        "Phosphate concentration",
+        T_GRID + TIMESTEPS,
+        "mmol P / m3",
+        "MOBI dissolved phosphate concentration",
+        write_to_restart=True,
+        active=_npzd,
+    ),
+    "no3": Variable(
+        "Nitrate concentration",
+        T_GRID + TIMESTEPS,
+        "mmol N / m3",
+        "MOBI dissolved nitrate concentration",
+        write_to_restart=True,
+        active=_nitrogen,
+    ),
+    "dop": Variable(
+        "Dissolved organic phosphorus concentration",
+        T_GRID + TIMESTEPS,
+        "mmol P / m3",
+        "MOBI dissolved organic phosphorus concentration",
+        write_to_restart=True,
+        active=_nitrogen,
+    ),
+    "don": Variable(
+        "Dissolved organic nitrogen concentration",
+        T_GRID + TIMESTEPS,
+        "mmol N / m3",
+        "MOBI dissolved organic nitrogen concentration",
+        write_to_restart=True,
+        active=_nitrogen,
+    ),
+    "diazotrophs": Variable(
+        "Diazotroph concentration",
+        T_GRID + TIMESTEPS,
+        "mmol N / m3",
+        "MOBI nitrogen-fixing diazotroph concentration",
+        write_to_restart=True,
+        active=_nitrogen,
+    ),
+    "oxygen": Variable(
+        "Dissolved oxygen concentration",
+        T_GRID + TIMESTEPS,
+        "mmol O2 / m3",
+        "MOBI dissolved oxygen concentration required by the nitrogen cycle",
+        write_to_restart=True,
+        active=_nitrogen,
+    ),
+    "dphytoplankton": Variable(
+        "Phytoplankton advective tendency",
+        T_GRID + TIMESTEPS,
+        "mmol N / (m3 s)",
+        "Advective tendency used by Adams-Bashforth time stepping",
+        write_to_restart=True,
+        active=_npzd,
+    ),
+    "dzooplankton": Variable(
+        "Zooplankton advective tendency",
+        T_GRID + TIMESTEPS,
+        "mmol N / (m3 s)",
+        "Advective tendency used by Adams-Bashforth time stepping",
+        write_to_restart=True,
+        active=_npzd,
+    ),
+    "ddetritus": Variable(
+        "Detritus advective tendency",
+        T_GRID + TIMESTEPS,
+        "mmol N / (m3 s)",
+        "Advective tendency used by Adams-Bashforth time stepping",
+        write_to_restart=True,
+        active=_npzd,
+    ),
+    "dpo4": Variable(
+        "Phosphate advective tendency",
+        T_GRID + TIMESTEPS,
+        "mmol P / (m3 s)",
+        "Advective tendency used by Adams-Bashforth time stepping",
+        write_to_restart=True,
+        active=_npzd,
+    ),
+    "dno3": Variable(
+        "Nitrate advective tendency",
+        T_GRID + TIMESTEPS,
+        "mmol N / (m3 s)",
+        "Advective tendency used by Adams-Bashforth time stepping",
+        write_to_restart=True,
+        active=_nitrogen,
+    ),
+    "ddop": Variable(
+        "Dissolved organic phosphorus advective tendency",
+        T_GRID + TIMESTEPS,
+        "mmol P / (m3 s)",
+        "Advective tendency used by Adams-Bashforth time stepping",
+        write_to_restart=True,
+        active=_nitrogen,
+    ),
+    "ddon": Variable(
+        "Dissolved organic nitrogen advective tendency",
+        T_GRID + TIMESTEPS,
+        "mmol N / (m3 s)",
+        "Advective tendency used by Adams-Bashforth time stepping",
+        write_to_restart=True,
+        active=_nitrogen,
+    ),
+    "ddiazotrophs": Variable(
+        "Diazotroph advective tendency",
+        T_GRID + TIMESTEPS,
+        "mmol N / (m3 s)",
+        "Advective tendency used by Adams-Bashforth time stepping",
+        write_to_restart=True,
+        active=_nitrogen,
+    ),
+    "doxygen": Variable(
+        "Dissolved oxygen advective tendency",
+        T_GRID + TIMESTEPS,
+        "mmol O2 / (m3 s)",
+        "Advective tendency used by Adams-Bashforth time stepping",
+        write_to_restart=True,
+        active=_nitrogen,
+    ),
+    "swr": Variable(
+        "Shortwave radiation",
+        T_HOR,
+        "W / m2",
+        "Incoming shortwave radiation at the sea surface",
+        active=_npzd,
+    ),
+    "rctheta": Variable(
+        "Effective light attenuation",
+        YT,
+        "1 / m",
+        "Water attenuation corrected for the solar incidence angle",
+        active=_npzd,
+    ),
+    "dayfrac": Variable(
+        "Daylight fraction",
+        YT,
+        "1",
+        "Fraction of the day with photosynthetically active radiation",
+        active=_npzd,
+    ),
+    "excretion_total": Variable(
+        "Zooplankton excretion",
+        T_GRID,
+        "mmol N / (m3 s)",
+        "Total zooplankton excretion rate",
+        active=_npzd,
+    ),
+    "net_primary_production": Variable(
+        "Net primary production",
+        T_GRID,
+        "mmol N / (m3 s)",
+        "Total phytoplankton and diazotroph net primary production rate",
+        active=_npzd,
+    ),
+    "detritus_remineralization": Variable(
+        "Detritus remineralization",
+        T_GRID,
+        "mmol N / (m3 s)",
+        "Detritus remineralization rate",
+        active=_npzd,
+    ),
+    "detritus_export": Variable(
+        "Detritus export",
+        T_GRID,
+        "mmol N / (m3 s)",
+        "Downward detritus export rate",
+        active=_npzd,
+    ),
+    "diazotroph_primary_production": Variable(
+        "Diazotroph primary production",
+        T_GRID,
+        "mmol N / (m3 s)",
+        "Diazotroph net primary production rate",
+        active=_nitrogen,
+    ),
+    "nitrogen_fixation": Variable(
+        "Nitrogen fixation",
+        T_GRID,
+        "mmol N / (m3 s)",
+        "Diazotroph nitrogen fixation rate",
+        active=_nitrogen,
+    ),
+    "water_column_denitrification": Variable(
+        "Water-column denitrification",
+        T_GRID,
+        "mmol N / (m3 s)",
+        "MOBI water-column nitrate loss to denitrification",
+        active=_nitrogen,
+    ),
+    "benthic_denitrification": Variable(
+        "Benthic denitrification",
+        T_GRID,
+        "mmol N / (m3 s)",
+        "MOBI sedimentary nitrate loss diagnosed in bottom cells",
+        active=_nitrogen,
+    ),
+    "dic": Variable(
+        "Dissolved inorganic carbon",
+        T_GRID + TIMESTEPS,
+        "mmol C / m3",
+        "Dissolved inorganic carbon concentration",
+        write_to_restart=True,
+        active=_carbon,
+    ),
+    "alkalinity": Variable(
+        "Total alkalinity",
+        T_GRID + TIMESTEPS,
+        "mmol eq / m3",
+        "Total alkalinity concentration",
+        write_to_restart=True,
+        active=_carbon,
+    ),
+    "ddic": Variable(
+        "DIC advective tendency",
+        T_GRID + TIMESTEPS,
+        "mmol C / (m3 s)",
+        "Advective tendency used by Adams-Bashforth time stepping",
+        write_to_restart=True,
+        active=_carbon,
+    ),
+    "dalkalinity": Variable(
+        "Alkalinity advective tendency",
+        T_GRID + TIMESTEPS,
+        "mmol eq / (m3 s)",
+        "Advective tendency used by Adams-Bashforth time stepping",
+        write_to_restart=True,
+        active=_carbon,
+    ),
+    "atmospheric_co2": Variable(
+        "Atmospheric CO2 concentration",
+        T_HOR,
+        "ppmv",
+        "Atmospheric dry-air CO2 mixing ratio",
+        active=_carbon,
+        initial=280.0,
+    ),
+    "cflux": Variable(
+        "Air-sea DIC flux",
+        T_HOR,
+        "mmol C / (m2 s)",
+        "Air-sea CO2 flux, positive into the ocean",
+        active=_carbon,
+    ),
+    "wind_speed": Variable(
+        "Diagnosed wind speed",
+        T_HOR,
+        "m / s",
+        "Wind speed diagnosed from surface wind stress",
+        active=_carbon,
+    ),
+    "hSWS": Variable(
+        "Hydrogen ion concentration",
+        T_HOR,
+        "mol / kg",
+        "Hydrogen ion concentration on the seawater scale",
+        active=_carbon,
+        initial=5e-7,
+    ),
+    "pCO2": Variable(
+        "Surface-ocean pCO2",
+        T_HOR,
+        "uatm",
+        "Partial pressure of CO2 in surface seawater",
+        active=_carbon,
+    ),
+    "dpCO2": Variable(
+        "Ocean-atmosphere pCO2 difference",
+        T_HOR,
+        "uatm",
+        "Surface-ocean minus atmospheric partial pressure of CO2",
+        active=_carbon,
+    ),
+    "co2star": Variable(
+        "Dissolved CO2 star",
+        T_HOR,
+        "mol / m3",
+        "Equilibrium dissolved CO2 concentration in surface seawater",
+        active=_carbon,
+    ),
+    "dco2star": Variable(
+        "Air-ocean dissolved CO2 star difference",
+        T_HOR,
+        "mol / m3",
+        "Atmospheric-equilibrium minus ocean dissolved CO2 concentration",
+        active=_carbon,
+    ),
+    "rcak": Variable(
+        "Calcite redistribution profile",
+        T_GRID,
+        "1 / m",
+        "Implicit calcite dissolution profile, including seafloor dissolution",
+        time_dependent=False,
+        active=_carbon,
+    ),
+}
+
+
+# Compatibility names used by Veros-BGC 0.1.x and by the generated docs.
+MAIN_VARIABLES = VARIABLES
+CONDITIONAL_VARIABLES = {}
